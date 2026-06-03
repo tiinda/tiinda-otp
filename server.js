@@ -32,6 +32,22 @@ const app = express();
 app.use(express.json());
 
 /* ─────────────────────────────────────────────────────────────────────────
+   0) CORS — autorise le thème Shopify à appeler ce backend directement
+   ─────────────────────────────────────────────────────────────────────────
+   Quand on n'utilise PAS l'App Proxy Shopify, le navigateur appelle ce
+   serveur en "cross-origin" (depuis tiinda.com vers onrender.com). Sans ces
+   en-têtes, le navigateur bloque la requête. On répond aussi au "preflight"
+   OPTIONS que le navigateur envoie avant un POST JSON.
+   ───────────────────────────────────────────────────────────────────────── */
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+/* ─────────────────────────────────────────────────────────────────────────
    1) Vérification de la signature Shopify App Proxy
    ─────────────────────────────────────────────────────────────────────────
    Shopify ajoute un paramètre ?signature=... à chaque requête proxifiée.
