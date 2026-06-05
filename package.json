@@ -1,14 +1,17 @@
 {
   "name": "tiinda-otp-backend",
-  "version": "1.0.0",
-  "description": "Backend OTP WhatsApp pour Tiinda (Twilio Verify + Shopify App Proxy)",
+  "version": "1.1.0",
+  "description": "TIINDA — Backend OTP WhatsApp (Twilio Verify) + base de donnees Supabase (clients, colis, recharges)",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "SKIP_PROXY_CHECK=1 node server.js"
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
     "express": "^4.19.2",
-    "twilio": "^5.0.0"
+    "twilio": "^5.3.0"
   }
 }
