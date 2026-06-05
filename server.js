@@ -31,6 +31,8 @@ const {
   SHOPIFY_API_SECRET,          // "API secret key" de ton app Shopify (signe le proxy)
   SUPABASE_URL,                // https://xxxx.supabase.co
   SUPABASE_SERVICE_KEY,        // clé secrète Supabase (sb_secret_...)
+  RESEND_API_KEY,              // clé API Resend (envoi d'emails) — optionnel
+  MAIL_FROM,                   // expéditeur, ex: "Tiinda <noreply@tiinda.com>"
   PORT = 3000,
 } = process.env;
 
@@ -187,13 +189,48 @@ app.get('/client', async (req, res) => {
   }
 });
 
+/* ── Envoi d'un email de confirmation via Resend (si la clé est configurée).
+   N'installe aucune librairie : simple appel HTTP. Si RESEND_API_KEY n'est
+   pas défini, la fonction ne fait rien (pas d'erreur). ───────────────────── */
+async function sendDeclarationEmail(client, colis) {
+  if (!RESEND_API_KEY || !client || !client.email) return;
+  const from = MAIL_FROM || 'Tiinda <onboarding@resend.dev>';
+  const prenom = client.prenom || 'cher client';
+  const euro = colis.valeur != null ? (' (' + colis.valeur + ' €)') : '';
+  const html =
+    '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:auto;color:#1a1a1a">' +
+      '<div style="background:#0057FF;color:#fff;padding:18px 22px;border-radius:12px 12px 0 0">' +
+        '<h2 style="margin:0;font-size:19px">Tiinda — Colis déclaré ✓</h2></div>' +
+      '<div style="border:1px solid #eee;border-top:none;padding:22px;border-radius:0 0 12px 12px">' +
+        '<p>Bonjour ' + prenom + ',</p>' +
+        '<p>Votre colis a bien été enregistré. Voici le récapitulatif :</p>' +
+        '<table style="width:100%;border-collapse:collapse;font-size:14px;margin:14px 0">' +
+          '<tr><td style="padding:8px 0;color:#666">N° de suivi Tiinda</td><td style="padding:8px 0;font-weight:bold;text-align:right">' + colis.tracking_interne + '</td></tr>' +
+          '<tr><td style="padding:8px 0;color:#666">Suivi transporteur</td><td style="padding:8px 0;text-align:right">' + (colis.tracking_externe || '—') + '</td></tr>' +
+          '<tr><td style="padding:8px 0;color:#666">Description</td><td style="padding:8px 0;text-align:right">' + (colis.description || '—') + '</td></tr>' +
+          '<tr><td style="padding:8px 0;color:#666">Site marchand</td><td style="padding:8px 0;text-align:right">' + (colis.site_marchand || '—') + '</td></tr>' +
+          '<tr><td style="padding:8px 0;color:#666">Valeur déclarée</td><td style="padding:8px 0;text-align:right">' + (colis.valeur != null ? colis.valeur + ' €' : '—') + '</td></tr>' +
+        '</table>' +
+        '<p style="font-size:13px;color:#666">Vous serez notifié sur WhatsApp dès la réception de votre colis à notre entrepôt. Conservez votre numéro de suivi Tiinda pour le retrait au Congo.</p>' +
+        '<p style="margin-top:18px">L’équipe Tiinda</p>' +
+      '</div></div>';
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to: client.email, subject: 'Tiinda — Colis déclaré (' + colis.tracking_interne + ')' + euro, html }),
+    });
+    if (!r.ok) console.error('email error:', r.status, await r.text());
+  } catch (e) { console.error('email send error:', e.message); }
+}
+
 /* ── 7) Route : déclarer un colis ─────────────────────────────────────────
    Génère un numéro de suivi interne unique (TND + horodatage). */
 app.post('/colis/declare', async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
     const phone = toE164(req.body.phone);
-    const { data: cli } = await db.from('clients').select('id').eq('phone', phone).limit(1).maybeSingle();
+    const { data: cli } = await db.from('clients').select('id, email, prenom, tiinda_id').eq('phone', phone).limit(1).maybeSingle();
     if (!cli) return res.json({ ok: false, error: 'client_not_found' });
 
     const tracking_interne = 'TND' + Date.now().toString().slice(-9);
@@ -207,6 +244,10 @@ app.post('/colis/declare', async (req, res) => {
       statut: 'declare',
     }).select().single();
     if (error) { console.error('colis error:', error.message); return res.json({ ok: false, error: 'insert_failed' }); }
+
+    // Email de confirmation (ne bloque pas la réponse si l'email échoue).
+    sendDeclarationEmail(cli, data);
+
     res.json({ ok: true, colis: data });
   } catch (err) {
     console.error('declare error:', err.message);
