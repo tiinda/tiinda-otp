@@ -497,6 +497,104 @@ app.get('/presence', async (req, res) => {
   } catch (e) { res.json({ ok: false }); }
 });
 
+/* ── 11) WALLET TIINDA ─────────────────────────────────────────────────────
+   Un seul solde par client (clients.wallet_balance). Deux canaux de recharge
+   qui s'additionnent : carte (Shopify) et code de recharge. Chaque crédit est
+   tracé dans la table `recharges`.
+   ───────────────────────────────────────────────────────────────────────── */
+
+// Crédite le wallet d'un client + journalise dans `recharges`.
+async function creditWallet(clientId, montant, moyen, code) {
+  if (!db) return null;
+  const { data: cli } = await db.from('clients').select('wallet_balance').eq('id', clientId).maybeSingle();
+  const newBal = Number((cli && cli.wallet_balance) || 0) + Number(montant);
+  await db.from('clients').update({ wallet_balance: newBal }).eq('id', clientId);
+  await db.from('recharges').insert({ client_id: clientId, montant: montant, moyen: moyen || 'code', code_recharge: code || null, statut: 'valide' });
+  return newBal;
+}
+
+// Solde + historique de recharges d'un client.
+app.get('/wallet', async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const phone = toE164(req.query.phone);
+    const { data: cli } = await db.from('clients').select('id, wallet_balance').eq('phone', phone).limit(1).maybeSingle();
+    if (!cli) return res.json({ ok: false, error: 'client_not_found' });
+    const { data: hist } = await db.from('recharges').select('*').eq('client_id', cli.id).order('created_at', { ascending: false }).limit(50);
+    res.json({ ok: true, balance: Number(cli.wallet_balance || 0), history: hist || [] });
+  } catch (err) {
+    console.error('wallet error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// Utiliser un code de recharge → crédite le wallet.
+app.post('/wallet/redeem', async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const phone = toE164(req.body.phone);
+    const code = String(req.body.code || '').trim().toUpperCase().replace(/[^A-Z0-9\-]/g, '');
+    if (!code) return res.json({ ok: false, error: 'missing_code' });
+    const { data: cli } = await db.from('clients').select('id').eq('phone', phone).limit(1).maybeSingle();
+    if (!cli) return res.json({ ok: false, error: 'client_not_found' });
+    const { data: rc } = await db.from('recharge_codes').select('*').eq('code', code).limit(1).maybeSingle();
+    if (!rc) return res.json({ ok: false, error: 'code_invalide' });
+    if (rc.used) return res.json({ ok: false, error: 'code_deja_utilise' });
+    // Marque le code utilisé puis crédite.
+    await db.from('recharge_codes').update({ used: true, used_by: cli.id, used_at: new Date().toISOString() }).eq('id', rc.id);
+    const newBal = await creditWallet(cli.id, rc.montant, 'code', code);
+    res.json({ ok: true, montant: Number(rc.montant), balance: newBal });
+  } catch (err) {
+    console.error('redeem error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// (ADMIN) Crédit par CARTE / manuel : ajoute du crédit au wallet d'un client.
+app.post('/admin/wallet/credit', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const b = req.body || {};
+    if (!b.client_id || !b.montant) return res.json({ ok: false, error: 'missing' });
+    const newBal = await creditWallet(b.client_id, b.montant, b.moyen || 'carte', null);
+    res.json({ ok: true, balance: newBal });
+  } catch (err) {
+    console.error('admin credit error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// (ADMIN) Générer des codes de recharge (montant + quantité).
+app.post('/admin/codes/generate', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const montant = Number(req.body.montant || 0);
+    const count = Math.min(Math.max(parseInt(req.body.count || 1, 10), 1), 100);
+    if (!montant) return res.json({ ok: false, error: 'missing_montant' });
+    const rnd = function () { var s = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', o = ''; for (var i = 0; i < 4; i++) o += s[Math.floor(Math.random() * s.length)]; return o; };
+    const rows = [];
+    for (var i = 0; i < count; i++) rows.push({ code: 'TND-' + rnd() + '-' + rnd(), montant: montant });
+    const { data, error } = await db.from('recharge_codes').insert(rows).select();
+    if (error) { console.error('codes gen error:', error.message); return res.json({ ok: false, error: 'gen_failed' }); }
+    res.json({ ok: true, codes: data || [] });
+  } catch (err) {
+    console.error('codes error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// (ADMIN) Liste des codes de recharge.
+app.get('/admin/codes', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data } = await db.from('recharge_codes').select('*').order('created_at', { ascending: false }).limit(200);
+    res.json({ ok: true, codes: data || [] });
+  } catch (err) {
+    console.error('list codes error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`TIINDA backend en écoute sur le port ${PORT} — Supabase: ${db ? 'OK' : 'NON configuré'}`);
 });
