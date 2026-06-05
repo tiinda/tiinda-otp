@@ -595,6 +595,43 @@ app.get('/admin/codes', requireAdmin, async (req, res) => {
   }
 });
 
+// (ADMIN) Liste complète des clients : solde, formule, présence, CA, dernier achat.
+app.get('/admin/clients', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data } = await db.from('clients').select('id, tiinda_id, prenom, nom, phone, email, ville, offre, wallet_balance, last_seen, created_at').order('created_at', { ascending: false });
+    const { data: rech } = await db.from('recharges').select('client_id, montant, created_at');
+    const { data: cols } = await db.from('colis').select('client_id, frais_envoi, created_at');
+    // Agrège CA total (recharges + frais d'envoi) et la date du dernier mouvement par client.
+    const ca = {}, last = {};
+    (rech || []).forEach(function (r) {
+      ca[r.client_id] = (ca[r.client_id] || 0) + Number(r.montant || 0);
+      if (r.created_at && (!last[r.client_id] || new Date(r.created_at) > new Date(last[r.client_id]))) last[r.client_id] = r.created_at;
+    });
+    (cols || []).forEach(function (c) {
+      ca[c.client_id] = (ca[c.client_id] || 0) + Number(c.frais_envoi || 0);
+      if (c.created_at && (!last[c.client_id] || new Date(c.created_at) > new Date(last[c.client_id]))) last[c.client_id] = c.created_at;
+    });
+    const cut = Date.now() - 5 * 60000;
+    const actifCut = Date.now() - 60 * 86400000; // actif = activité < 60 jours
+    const rows = (data || []).map(function (c) {
+      const online = c.last_seen ? (new Date(c.last_seen).getTime() >= cut) : false;
+      const lastAct = last[c.id] || c.created_at;
+      const actif = online || (lastAct && new Date(lastAct).getTime() >= actifCut);
+      return {
+        tiinda_id: c.tiinda_id, prenom: c.prenom, nom: c.nom, phone: c.phone, email: c.email,
+        ville: c.ville, offre: c.offre, wallet_balance: Number(c.wallet_balance || 0),
+        online: online, ca_total: Number(ca[c.id] || 0), dernier_achat: last[c.id] || null,
+        actif: !!actif, created_at: c.created_at,
+      };
+    });
+    res.json({ ok: true, clients: rows });
+  } catch (err) {
+    console.error('admin clients error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`TIINDA backend en écoute sur le port ${PORT} — Supabase: ${db ? 'OK' : 'NON configuré'}`);
 });
