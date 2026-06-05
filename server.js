@@ -33,6 +33,7 @@ const {
   SUPABASE_SERVICE_KEY,        // clé secrète Supabase (sb_secret_...)
   RESEND_API_KEY,              // clé API Resend (envoi d'emails) — optionnel
   MAIL_FROM,                   // expéditeur, ex: "Tiinda <noreply@tiinda.com>"
+  TRACK123_API_KEY,            // clé API Track123 (suivi colis) — optionnel
   PORT = 3000,
 } = process.env;
 
@@ -254,6 +255,8 @@ app.post('/colis/declare', async (req, res) => {
 
     // Email de confirmation (ne bloque pas la réponse si l'email échoue).
     sendDeclarationEmail(cli, data);
+    // Enregistre le n° transporteur chez Track123 pour le suivi automatique.
+    if (data.tracking_externe) track123Import(data.tracking_externe);
 
     res.json({ ok: true, colis: data });
   } catch (err) {
@@ -278,7 +281,101 @@ app.get('/colis', async (req, res) => {
   }
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true, db: !!db }));
+/* ── 9) Suivi Track123 ─────────────────────────────────────────────────────
+   • track123Import : enregistre un n° de suivi pour que Track123 le surveille.
+   • track123Query  : récupère le statut + l'historique d'un n° de suivi.
+   • extractTrack   : normalise la réponse (statut + événements) de façon
+                      défensive, quelle que soit la profondeur exacte du JSON.
+   ───────────────────────────────────────────────────────────────────────── */
+const TRACK123_BASE = 'https://api.track123.com/gateway/open-api/tk/v2';
+
+async function track123Import(trackNo) {
+  if (!TRACK123_API_KEY || !trackNo) return;
+  try {
+    await fetch(TRACK123_BASE + '/track/import', {
+      method: 'POST',
+      headers: { 'Track123-Api-Secret': TRACK123_API_KEY, 'accept': 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify([{ trackNo: trackNo, courierCode: '' }]),
+    });
+  } catch (e) { console.error('track123 import error:', e.message); }
+}
+
+async function track123Query(trackNo) {
+  if (!TRACK123_API_KEY || !trackNo) return null;
+  try {
+    const r = await fetch(TRACK123_BASE + '/track/query', {
+      method: 'POST',
+      headers: { 'Track123-Api-Secret': TRACK123_API_KEY, 'accept': 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({ trackNos: [trackNo] }),
+    });
+    return await r.json();
+  } catch (e) { console.error('track123 query error:', e.message); return null; }
+}
+
+// Recherche récursive : trouve le 1er objet contenant un n° de suivi.
+function findTrackObject(node, trackNo) {
+  if (!node || typeof node !== 'object') return null;
+  if (Array.isArray(node)) {
+    for (const it of node) { const f = findTrackObject(it, trackNo); if (f) return f; }
+    return null;
+  }
+  if (node.trackNo === trackNo || node.trackingNo === trackNo) return node;
+  for (const k in node) { const f = findTrackObject(node[k], trackNo); if (f) return f; }
+  return null;
+}
+
+// Normalise statut + événements depuis la réponse Track123 (défensif).
+function extractTrack(raw, trackNo) {
+  const obj = findTrackObject(raw, trackNo) || {};
+  const info = obj.trackInfo || obj.tracking || obj;
+  // Statut
+  const latest = info.latestStatus || info.lastStatus || {};
+  let status = latest.status || latest.statusName || info.status ||
+               obj.transitStatus || obj.status || '';
+  let sub = latest.subStatus || info.transitSubStatus || '';
+  // Événements (cherche un tableau d'objets avec une date + un libellé)
+  let events = info.trackingDetails || info.events || info.trackDetails ||
+               info.checkpoints || [];
+  if (!Array.isArray(events)) events = [];
+  const norm = events.map(function (e) {
+    return {
+      time: e.eventTime || e.checkpointTime || e.time || e.date || '',
+      detail: e.eventDetail || e.statusDescription || e.detail || e.description || e.context || '',
+      location: e.address || e.location || e.eventLocation || e.city || '',
+    };
+  });
+  return { status: status, subStatus: sub, events: norm };
+}
+
+/* ── Route : suivi d'un colis (par n° interne TND ou n° transporteur) ─────── */
+app.get('/track', async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const q = String(req.query.q || '').trim();
+    if (!q) return res.json({ ok: false, error: 'missing_query' });
+    // Retrouve le colis par n° interne OU n° transporteur.
+    let { data: colis } = await db.from('colis').select('*')
+      .or('tracking_interne.eq.' + q + ',tracking_externe.eq.' + q).limit(1).maybeSingle();
+    if (!colis) return res.json({ ok: false, error: 'not_found' });
+    const carrierNo = colis.tracking_externe;
+    if (!carrierNo) return res.json({ ok: true, colis: colis, track: null, error: 'no_carrier_number' });
+    // S'assure que Track123 surveille bien ce numéro (idempotent), puis interroge.
+    await track123Import(carrierNo);
+    const raw = await track123Query(carrierNo);
+    const track = raw ? extractTrack(raw, carrierNo) : null;
+    res.json({ ok: true, colis: {
+      tracking_interne: colis.tracking_interne,
+      tracking_externe: colis.tracking_externe,
+      description: colis.description,
+      statut: colis.statut,
+    }, track: track, raw: raw });
+  } catch (err) {
+    console.error('track error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+app.get('/health', (_req, res) => res.json({ ok: true, db: !!db, track123: !!TRACK123_API_KEY }));
 
 app.listen(PORT, () => {
   console.log(`TIINDA backend en écoute sur le port ${PORT} — Supabase: ${db ? 'OK' : 'NON configuré'}`);
