@@ -34,6 +34,7 @@ const {
   RESEND_API_KEY,              // clé API Resend (envoi d'emails) — optionnel
   MAIL_FROM,                   // expéditeur, ex: "Tiinda <noreply@tiinda.com>"
   TRACK123_API_KEY,            // clé API Track123 (suivi colis) — optionnel
+  ADMIN_TOKEN,                 // mot de passe du panneau Admin Tiinda
   PORT = 3000,
 } = process.env;
 
@@ -393,6 +394,108 @@ app.get('/track', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true, db: !!db, track123: !!TRACK123_API_KEY }));
+
+/* ── 10) PANNEAU ADMIN (équipe Tiinda) ─────────────────────────────────────
+   Protégé par ADMIN_TOKEN (query ?token= ou header x-admin-token). */
+function requireAdmin(req, res, next) {
+  const token = req.query.token || req.headers['x-admin-token'];
+  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  next();
+}
+
+// Liste tous les colis (avec infos client) — filtrable par statut.
+app.get('/admin/colis', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    let q = db.from('colis').select('*, clients(prenom,nom,phone,email,tiinda_id)').order('created_at', { ascending: false });
+    if (req.query.statut) q = q.eq('statut', req.query.statut);
+    const { data, error } = await q;
+    if (error) { console.error('admin list error:', error.message); return res.json({ ok: false, error: 'list_failed' }); }
+    res.json({ ok: true, colis: data || [] });
+  } catch (err) {
+    console.error('admin colis error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// Met à jour un colis : statut, poids, dimensions, photo, frais d'envoi.
+app.post('/admin/colis/update', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const b = req.body || {};
+    if (!b.id) return res.json({ ok: false, error: 'missing_id' });
+    const patch = {};
+    if (b.statut) patch.statut = b.statut;
+    if (b.poids != null && b.poids !== '') patch.poids = b.poids;
+    if (b.longueur != null && b.longueur !== '') patch.longueur = b.longueur;
+    if (b.largeur != null && b.largeur !== '') patch.largeur = b.largeur;
+    if (b.hauteur != null && b.hauteur !== '') patch.hauteur = b.hauteur;
+    if (b.photo_url) patch.photo_url = b.photo_url;
+    if (b.frais_envoi != null && b.frais_envoi !== '') patch.frais_envoi = b.frais_envoi;
+    if (b.statut === 'recu') patch.received_at = new Date().toISOString();
+    const { data, error } = await db.from('colis').update(patch).eq('id', b.id).select().single();
+    if (error) { console.error('admin update error:', error.message); return res.json({ ok: false, error: 'update_failed' }); }
+    res.json({ ok: true, colis: data });
+  } catch (err) {
+    console.error('admin update error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// Indicateurs (KPI) pour le pilotage : abonnés, colis, CA, répartitions.
+app.get('/admin/stats', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data: clients } = await db.from('clients').select('offre, ville, created_at, wallet_balance, last_seen');
+    const { data: colis } = await db.from('colis').select('statut, valeur, poids, frais_envoi, created_at');
+    const cl = clients || [], co = colis || [];
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const onlineCut = new Date(now.getTime() - 5 * 60000); // en ligne = vu il y a < 5 min
+    const norm = function (s) { s = (s || '').toLowerCase(); return s.indexOf('mokili') >= 0 ? 'mokili' : s.indexOf('familia') >= 0 ? 'familia' : 'bokolo'; };
+    const byOffre = { bokolo: 0, familia: 0, mokili: 0 };
+    const byOffreToday = { bokolo: 0, familia: 0, mokili: 0 };
+    const byVille = {};
+    let clientsThisMonth = 0, clientsToday = 0, onlineNow = 0;
+    cl.forEach(function (c) {
+      var o = norm(c.offre); byOffre[o]++;
+      const v = (c.ville || 'Inconnue'); byVille[v] = (byVille[v] || 0) + 1;
+      if (c.created_at && new Date(c.created_at) >= monthStart) clientsThisMonth++;
+      if (c.created_at && new Date(c.created_at) >= dayStart) { clientsToday++; byOffreToday[o]++; }
+      if (c.last_seen && new Date(c.last_seen) >= onlineCut) onlineNow++;
+    });
+    const byStatut = {};
+    let valeurTotale = 0, poidsTotal = 0, fraisEnvoiTotal = 0, colisThisMonth = 0, colisToday = 0, fraisEnvoiToday = 0;
+    co.forEach(function (c) {
+      byStatut[c.statut || 'declare'] = (byStatut[c.statut || 'declare'] || 0) + 1;
+      valeurTotale += Number(c.valeur || 0);
+      poidsTotal += Number(c.poids || 0);
+      fraisEnvoiTotal += Number(c.frais_envoi || 0);
+      if (c.created_at && new Date(c.created_at) >= monthStart) colisThisMonth++;
+      if (c.created_at && new Date(c.created_at) >= dayStart) { colisToday++; fraisEnvoiToday += Number(c.frais_envoi || 0); }
+    });
+    res.json({ ok: true, stats: {
+      clientsTotal: cl.length, clientsThisMonth: clientsThisMonth, clientsToday: clientsToday, onlineNow: onlineNow,
+      colisTotal: co.length, colisThisMonth: colisThisMonth, colisToday: colisToday,
+      byOffre: byOffre, byOffreToday: byOffreToday, byVille: byVille, byStatut: byStatut,
+      valeurTotale: valeurTotale, poidsTotal: poidsTotal, fraisEnvoiTotal: fraisEnvoiTotal, fraisEnvoiToday: fraisEnvoiToday,
+    }});
+  } catch (err) {
+    console.error('admin stats error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// Présence « en ligne » : le tableau de bord client appelle ceci périodiquement.
+app.get('/presence', async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false });
+    const phone = toE164(req.query.phone);
+    if (phone) await db.from('clients').update({ last_seen: new Date().toISOString() }).eq('phone', phone);
+    res.json({ ok: true });
+  } catch (e) { res.json({ ok: false }); }
+});
 
 app.listen(PORT, () => {
   console.log(`TIINDA backend en écoute sur le port ${PORT} — Supabase: ${db ? 'OK' : 'NON configuré'}`);
