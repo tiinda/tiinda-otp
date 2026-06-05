@@ -324,18 +324,34 @@ function findTrackObject(node, trackNo) {
   return null;
 }
 
-// Normalise statut + événements depuis la réponse Track123 (défensif).
+// Traduit les statuts Track123 en libellés FR + une classe de couleur.
+const TRACK123_STATUS_FR = {
+  INIT:            { label: 'Enregistré',        cls: 'transit' },
+  PENDING:         { label: 'En attente',        cls: 'transit' },
+  INFO_RECEIVED:   { label: 'Pris en charge',    cls: 'received' },
+  IN_TRANSIT:      { label: 'En transit',        cls: 'transit' },
+  OUT_FOR_DELIVERY:{ label: 'En cours de livraison', cls: 'shipped' },
+  DELIVERED:       { label: 'Livré',             cls: 'delivered' },
+  EXCEPTION:       { label: 'Incident',          cls: 'transit' },
+  FAILED_ATTEMPT:  { label: 'Tentative échouée', cls: 'transit' },
+  EXPIRED:         { label: 'Expiré',            cls: 'transit' },
+};
+
+// Normalise statut + transporteur + événements depuis la réponse Track123.
 function extractTrack(raw, trackNo) {
   const obj = findTrackObject(raw, trackNo) || {};
   const info = obj.trackInfo || obj.tracking || obj;
-  // Statut
+  // Statut (transitStatus est le champ principal de Track123)
   const latest = info.latestStatus || info.lastStatus || {};
-  let status = latest.status || latest.statusName || info.status ||
-               obj.transitStatus || obj.status || '';
-  let sub = latest.subStatus || info.transitSubStatus || '';
-  // Événements (cherche un tableau d'objets avec une date + un libellé)
+  let code = (obj.transitStatus || latest.status || info.status || '').toString().toUpperCase();
+  const fr = TRACK123_STATUS_FR[code] || { label: code || 'En attente', cls: 'transit' };
+  // Transporteur détecté
+  const li = obj.localLogisticsInfo || info.localLogisticsInfo || {};
+  const courier = li.courierNameEN || li.courierNameCN || li.courierCode || '';
+  const courierLink = li.courierTrackingLink || '';
+  // Événements (présents une fois que Track123 a récupéré les données)
   let events = info.trackingDetails || info.events || info.trackDetails ||
-               info.checkpoints || [];
+               info.checkpoints || li.trackingDetails || obj.trackingDetails || [];
   if (!Array.isArray(events)) events = [];
   const norm = events.map(function (e) {
     return {
@@ -344,16 +360,17 @@ function extractTrack(raw, trackNo) {
       location: e.address || e.location || e.eventLocation || e.city || '',
     };
   });
-  return { status: status, subStatus: sub, events: norm };
+  return { code: code, status: fr.label, cls: fr.cls, courier: courier, courierLink: courierLink, events: norm };
 }
 
 /* ── Route : suivi d'un colis (par n° interne TND ou n° transporteur) ─────── */
 app.get('/track', async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
-    const q = String(req.query.q || '').trim();
+    const q = String(req.query.q || '').trim().replace(/[^A-Za-z0-9\-]/g, '');
     if (!q) return res.json({ ok: false, error: 'missing_query' });
-    // Retrouve le colis par n° interne OU n° transporteur.
+    // Retrouve le colis par n° interne Tiinda (TND…) OU n° transporteur.
+    // → taper le numéro Tiinda suffit : il est relié au n° transporteur déclaré.
     let { data: colis } = await db.from('colis').select('*')
       .or('tracking_interne.eq.' + q + ',tracking_externe.eq.' + q).limit(1).maybeSingle();
     if (!colis) return res.json({ ok: false, error: 'not_found' });
