@@ -199,21 +199,28 @@ async function sendDeclarationEmail(client, colis) {
   const euro = colis.valeur != null ? (' (' + colis.valeur + ' €)') : '';
   const html =
     '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:auto;color:#1a1a1a">' +
-      '<div style="background:#0057FF;color:#fff;padding:18px 22px;border-radius:12px 12px 0 0">' +
-        '<h2 style="margin:0;font-size:19px">Tiinda — Colis déclaré ✓</h2></div>' +
+      '<div style="background:#0057FF;color:#fff;padding:22px;border-radius:12px 12px 0 0;text-align:center">' +
+        '<div style="font-size:22px;font-weight:800;letter-spacing:.5px">TIINDA</div>' +
+        '<div style="font-size:13px;opacity:.85;margin-top:2px">Colis déclaré ✓</div></div>' +
       '<div style="border:1px solid #eee;border-top:none;padding:22px;border-radius:0 0 12px 12px">' +
         '<p>Bonjour ' + prenom + ',</p>' +
         '<p>Votre colis a bien été enregistré. Voici le récapitulatif :</p>' +
         '<table style="width:100%;border-collapse:collapse;font-size:14px;margin:14px 0">' +
-          '<tr><td style="padding:8px 0;color:#666">N° de suivi Tiinda</td><td style="padding:8px 0;font-weight:bold;text-align:right">' + colis.tracking_interne + '</td></tr>' +
+          '<tr><td style="padding:8px 0;color:#666">N° de suivi Tiinda</td><td style="padding:8px 0;font-weight:bold;text-align:right;color:#0057FF">' + colis.tracking_interne + '</td></tr>' +
           '<tr><td style="padding:8px 0;color:#666">Suivi transporteur</td><td style="padding:8px 0;text-align:right">' + (colis.tracking_externe || '—') + '</td></tr>' +
           '<tr><td style="padding:8px 0;color:#666">Description</td><td style="padding:8px 0;text-align:right">' + (colis.description || '—') + '</td></tr>' +
           '<tr><td style="padding:8px 0;color:#666">Site marchand</td><td style="padding:8px 0;text-align:right">' + (colis.site_marchand || '—') + '</td></tr>' +
           '<tr><td style="padding:8px 0;color:#666">Valeur déclarée</td><td style="padding:8px 0;text-align:right">' + (colis.valeur != null ? colis.valeur + ' €' : '—') + '</td></tr>' +
         '</table>' +
+        '<div style="text-align:center;background:#F5F8FF;border:1px solid #E1EAFF;border-radius:12px;padding:18px;margin:18px 0">' +
+          '<img src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=0&data=' + encodeURIComponent(colis.tracking_interne) + '" alt="QR de retrait" width="160" height="160" style="background:#fff;border-radius:10px;padding:8px" />' +
+          '<div style="font-size:13px;color:#444;margin-top:10px"><strong>QR de retrait</strong> — présentez-le pour récupérer votre colis dans un casier ou point relais Tiinda au Congo.</div>' +
+        '</div>' +
         '<p style="font-size:13px;color:#666">Vous serez notifié sur WhatsApp dès la réception de votre colis à notre entrepôt. Conservez votre numéro de suivi Tiinda pour le retrait au Congo.</p>' +
         '<p style="margin-top:18px">L’équipe Tiinda</p>' +
-      '</div></div>';
+      '</div>' +
+      '<div style="text-align:center;color:#999;font-size:11px;padding:14px">Tiinda — une marque de Colispo · France · Congo-Brazzaville &amp; RDC</div>' +
+    '</div>';
   try {
     const r = await fetch('https://api.resend.com/emails', {
       method: 'POST',
