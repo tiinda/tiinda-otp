@@ -331,7 +331,7 @@ const TRACK123_STATUS_FR = {
   INFO_RECEIVED:   { label: 'Pris en charge',    cls: 'received' },
   IN_TRANSIT:      { label: 'En transit',        cls: 'transit' },
   OUT_FOR_DELIVERY:{ label: 'En cours de livraison', cls: 'shipped' },
-  DELIVERED:       { label: 'Livré',             cls: 'delivered' },
+  DELIVERED:       { label: 'Reçu chez Tiinda 🇫🇷', cls: 'received' },
   EXCEPTION:       { label: 'Incident',          cls: 'transit' },
   FAILED_ATTEMPT:  { label: 'Tentative échouée', cls: 'transit' },
   EXPIRED:         { label: 'Expiré',            cls: 'transit' },
