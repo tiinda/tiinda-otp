@@ -765,6 +765,10 @@ app.post('/admin/scan', requireScan, async (req, res) => {
     const { data, error } = await db.from('colis').update(patch).eq('id', colis.id).select().single();
     if (error) { console.error('scan update error:', error.message); return res.json({ ok: false, error: 'update_failed' }); }
     if (colis.statut !== statut) notifyColisStatus(colis.client_id, data).catch(function(){});
+    // Émission auto de facture quand le colis part vers le Congo (frais d'envoi connus).
+    if (statut === 'expedie' && data.frais_envoi && colis.statut !== 'expedie') {
+      emitInvoice(colis.client_id, 'Expédition ' + data.tracking_interne + ' vers le Congo', data.frais_envoi, data.tracking_interne).catch(function(){});
+    }
     res.json({ ok: true, colis: data });
   } catch (err) {
     console.error('scan error:', err.message);
@@ -924,6 +928,62 @@ app.post('/password/change', requireAuth, async (req, res) => {
     console.error('password change error:', err.message);
     res.status(500).json({ ok: false, error: 'server_error' });
   }
+});
+
+// Activité récente du client : événements dérivés des colis + recharges.
+// ── FACTURES ───────────────────────────────────────────────────────────────
+async function emitInvoice(clientId, description, montant, ref) {
+  if (!db || !clientId) return null;
+  const year = new Date().getFullYear();
+  const { count } = await db.from('factures').select('id', { count: 'exact', head: true });
+  const num = 'TND-INV-' + year + '-' + String((count || 0) + 1).padStart(4, '0');
+  const { data, error } = await db.from('factures').insert({
+    client_id: clientId, numero: num, description: description || 'Service Tiinda',
+    montant: Number(montant || 0), ref: ref || null, statut: 'emise',
+  }).select().single();
+  if (error) { console.error('emit invoice error:', error.message); return null; }
+  return data;
+}
+app.get('/factures', requireAuth, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data: cli } = await db.from('clients').select('id').eq('phone', req.clientPhone).limit(1).maybeSingle();
+    if (!cli) return res.json({ ok: false, error: 'not_found' });
+    const { data } = await db.from('factures').select('*').eq('client_id', cli.id).eq('statut', 'emise').order('created_at', { ascending: false });
+    res.json({ ok: true, factures: data || [] });
+  } catch (err) { console.error('factures error:', err.message); res.status(500).json({ ok: false, error: 'server_error' }); }
+});
+app.get('/admin/factures', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data } = await db.from('factures').select('*, clients(prenom,nom,tiinda_id,phone)').order('created_at', { ascending: false }).limit(300);
+    res.json({ ok: true, factures: data || [] });
+  } catch (err) { console.error('admin factures error:', err.message); res.status(500).json({ ok: false, error: 'server_error' }); }
+});
+app.post('/admin/factures/create', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const b = req.body || {};
+    const tid = String(b.tiinda_id || '').trim().toUpperCase();
+    const { data: cli } = await db.from('clients').select('id').eq('tiinda_id', tid).limit(1).maybeSingle();
+    if (!cli) return res.json({ ok: false, error: 'client_introuvable' });
+    const inv = await emitInvoice(cli.id, b.description, b.montant, b.ref);
+    res.json({ ok: !!inv, facture: inv });
+  } catch (err) { console.error('create facture error:', err.message); res.status(500).json({ ok: false, error: 'server_error' }); }
+});
+app.post('/admin/factures/update', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const b = req.body || {};
+    if (!b.id) return res.json({ ok: false, error: 'missing_id' });
+    const patch = {};
+    if (b.description != null) patch.description = b.description;
+    if (b.montant != null && b.montant !== '') patch.montant = Number(b.montant);
+    if (b.statut) patch.statut = b.statut;
+    const { data, error } = await db.from('factures').update(patch).eq('id', b.id).select().single();
+    if (error) { console.error('update facture error:', error.message); return res.json({ ok: false, error: 'update_failed' }); }
+    res.json({ ok: true, facture: data });
+  } catch (err) { console.error('update facture error:', err.message); res.status(500).json({ ok: false, error: 'server_error' }); }
 });
 
 // Activité récente du client : événements dérivés des colis + recharges.
