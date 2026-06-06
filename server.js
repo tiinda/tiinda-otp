@@ -926,6 +926,34 @@ app.post('/password/change', requireAuth, async (req, res) => {
   }
 });
 
+// Activité récente du client : événements dérivés des colis + recharges.
+app.get('/activity', requireAuth, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data: cli } = await db.from('clients').select('id').eq('phone', req.clientPhone).limit(1).maybeSingle();
+    if (!cli) return res.json({ ok: false, error: 'not_found' });
+    const { data: colis } = await db.from('colis').select('tracking_interne, description, statut, created_at, received_at').eq('client_id', cli.id).order('created_at', { ascending: false }).limit(20);
+    const { data: rech } = await db.from('recharges').select('montant, moyen, created_at').eq('client_id', cli.id).order('created_at', { ascending: false }).limit(20);
+    const STMSG = { declare: 'déclaré', recu: 'reçu à notre entrepôt en France', expedie: 'expédié vers le Congo', arrive: 'arrivé au Congo', disponible: 'disponible au retrait', livre: 'retiré' };
+    const events = [];
+    (colis || []).forEach(function (c) {
+      events.push({ type: 'colis', when: c.received_at || c.created_at, title: 'Colis ' + c.tracking_interne + ' ' + (STMSG[c.statut] || c.statut), detail: (c.description || '') });
+    });
+    (rech || []).forEach(function (r) {
+      const m = Number(r.montant || 0);
+      const isReward = r.moyen === 'parrainage';
+      events.push({ type: 'wallet', when: r.created_at,
+        title: isReward ? 'Récompense parrainage +' + m + ' €' : (m >= 0 ? 'Recharge de ' + m + ' €' : 'Débit de ' + Math.abs(m) + ' €'),
+        detail: isReward ? 'Un filleul a effectué son premier envoi.' : (r.moyen === 'code' ? 'Par code de recharge' : (r.moyen === 'carte' ? 'Par carte bancaire' : (r.moyen === 'sms' ? 'Notification SMS' : ''))) });
+    });
+    events.sort(function (a, b) { return new Date(b.when) - new Date(a.when); });
+    res.json({ ok: true, events: events.slice(0, 25) });
+  } catch (err) {
+    console.error('activity error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 // Programme de parrainage : code, lien, filleuls, récompenses gagnées.
 app.get('/referral', requireAuth, async (req, res) => {
   try {
