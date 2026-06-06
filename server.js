@@ -667,6 +667,47 @@ app.get('/admin/colis', requireAdmin, async (req, res) => {
   }
 });
 
+// Notifie le client d'un changement de statut (WhatsApp gratuit + SMS payant + email).
+const STATUT_MSG = {
+  recu: 'est bien arrivé à notre entrepôt en France',
+  expedie: 'a été expédié vers le Congo',
+  disponible: 'est disponible au retrait',
+  livre: 'a été retiré. Merci !',
+};
+async function notifyColisStatus(clientId, colis) {
+  if (!db || !clientId || !colis) return;
+  const { data: cli } = await db.from('clients').select('id, prenom, email, phone, wallet_balance, notif_email, notif_sms, notif_whatsapp').eq('id', clientId).maybeSingle();
+  if (!cli) return;
+  const action = STATUT_MSG[colis.statut] || ('a changé de statut : ' + colis.statut);
+  const ref = colis.tracking_interne || '';
+  const text = 'Tiinda : votre colis ' + ref + ' ' + action + '.';
+  // WhatsApp (gratuit) via Twilio Verify n'envoie pas de texte libre → on tente
+  // l'API Messages si un numéro WhatsApp d'envoi est configuré ; sinon on ignore.
+  if (cli.notif_whatsapp && process.env.TWILIO_WHATSAPP_FROM) {
+    try {
+      await client.messages.create({ from: 'whatsapp:' + process.env.TWILIO_WHATSAPP_FROM, to: 'whatsapp:' + cli.phone, body: text });
+    } catch (e) { console.error('notif wa error:', e.message); }
+  }
+  // SMS (payant : 0,10 € débité du wallet si solde suffisant)
+  if (cli.notif_sms && process.env.TWILIO_SMS_FROM) {
+    const cost = 0.10;
+    if (Number(cli.wallet_balance || 0) >= cost) {
+      try {
+        await client.messages.create({ from: process.env.TWILIO_SMS_FROM, to: cli.phone, body: text });
+        await db.from('clients').update({ wallet_balance: Number(cli.wallet_balance) - cost }).eq('id', cli.id);
+        await db.from('recharges').insert({ client_id: cli.id, montant: -cost, moyen: 'sms', statut: 'valide' });
+      } catch (e) { console.error('notif sms error:', e.message); }
+    }
+  }
+  // Email (gratuit)
+  if (cli.notif_email && cli.email && RESEND_API_KEY) {
+    const html = '<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto"><div style="background:#0057FF;color:#fff;padding:18px;border-radius:12px 12px 0 0;text-align:center"><strong style="font-size:18px">TIINDA</strong></div><div style="border:1px solid #eee;border-top:none;padding:22px;border-radius:0 0 12px 12px"><p>Bonjour ' + (cli.prenom || '') + ',</p><p>Votre colis <strong>' + ref + '</strong> ' + action + '.</p><p style="font-size:12.5px;color:#666">Suivez votre colis depuis votre espace Tiinda.</p></div></div>';
+    try {
+      await fetch('https://api.resend.com/emails', { method: 'POST', headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify({ from: MAIL_FROM || 'Tiinda <onboarding@resend.dev>', to: cli.email, subject: 'Tiinda — Mise à jour de votre colis ' + ref, html }) });
+    } catch (e) { console.error('notif mail error:', e.message); }
+  }
+}
+
 // Met à jour un colis : statut, poids, dimensions, photo, frais d'envoi.
 app.post('/admin/colis/update', requireAdmin, async (req, res) => {
   try {
@@ -682,8 +723,14 @@ app.post('/admin/colis/update', requireAdmin, async (req, res) => {
     if (b.photo_url) patch.photo_url = b.photo_url;
     if (b.frais_envoi != null && b.frais_envoi !== '') patch.frais_envoi = b.frais_envoi;
     if (b.statut === 'recu') patch.received_at = new Date().toISOString();
+    // Statut avant mise à jour (pour notifier seulement si changement réel).
+    const { data: before } = await db.from('colis').select('statut, client_id, tracking_interne, description').eq('id', b.id).maybeSingle();
     const { data, error } = await db.from('colis').update(patch).eq('id', b.id).select().single();
     if (error) { console.error('admin update error:', error.message); return res.json({ ok: false, error: 'update_failed' }); }
+    // Notifie le client si le STATUT a changé.
+    if (b.statut && before && before.statut !== b.statut) {
+      notifyColisStatus(before.client_id, data).catch(function(){});
+    }
     res.json({ ok: true, colis: data });
   } catch (err) {
     console.error('admin update error:', err.message);
