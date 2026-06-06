@@ -652,6 +652,15 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// Accès "scan entrepôt" : accepte le token ADMIN **ou** un SCAN_TOKEN dédié,
+// pour pouvoir déléguer le scan à l'équipe sans donner l'accès admin complet.
+function requireScan(req, res, next) {
+  const token = req.headers['x-scan-token'] || req.headers['x-admin-token'];
+  const ok = function (ref) { if (!ref || !token) return false; const a = Buffer.from(String(token)), b = Buffer.from(String(ref)); return a.length === b.length && crypto.timingSafeEqual(a, b); };
+  if (ok(process.env.SCAN_TOKEN) || ok(ADMIN_TOKEN)) return next();
+  return res.status(401).json({ ok: false, error: 'unauthorized' });
+}
+
 // Liste tous les colis (avec infos client) — filtrable par statut.
 app.get('/admin/colis', requireAdmin, async (req, res) => {
   try {
@@ -671,6 +680,7 @@ app.get('/admin/colis', requireAdmin, async (req, res) => {
 const STATUT_MSG = {
   recu: 'est bien arrivé à notre entrepôt en France',
   expedie: 'a été expédié vers le Congo',
+  arrive: 'est arrivé au Congo',
   disponible: 'est disponible au retrait',
   livre: 'a été retiré. Merci !',
 };
@@ -714,6 +724,32 @@ async function notifyColisStatus(clientId, colis) {
   }
 }
 
+// Scan entrepôt : trouve un colis par son numéro Tiinda (TND…) et met à jour
+// son statut en un seul appel. Notifie le client + stocke signature/photo.
+app.post('/admin/scan', requireScan, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const b = req.body || {};
+    const code = String(b.code || '').trim().toUpperCase().replace(/[^A-Z0-9\-]/g, '');
+    const statut = String(b.statut || '').trim();
+    if (!code || !statut) return res.json({ ok: false, error: 'missing' });
+    const { data: colis } = await db.from('colis').select('id, statut, client_id, tracking_interne, description')
+      .or('tracking_interne.eq.' + code + ',tracking_externe.eq.' + code).limit(1).maybeSingle();
+    if (!colis) return res.json({ ok: false, error: 'colis_introuvable' });
+    const patch = { statut: statut };
+    if (statut === 'recu') patch.received_at = new Date().toISOString();
+    if (b.signature_url) patch.signature_url = b.signature_url;
+    if (b.photo_url) patch.photo_url = b.photo_url;
+    const { data, error } = await db.from('colis').update(patch).eq('id', colis.id).select().single();
+    if (error) { console.error('scan update error:', error.message); return res.json({ ok: false, error: 'update_failed' }); }
+    if (colis.statut !== statut) notifyColisStatus(colis.client_id, data).catch(function(){});
+    res.json({ ok: true, colis: data });
+  } catch (err) {
+    console.error('scan error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 // Met à jour un colis : statut, poids, dimensions, photo, frais d'envoi.
 app.post('/admin/colis/update', requireAdmin, async (req, res) => {
   try {
@@ -727,6 +763,7 @@ app.post('/admin/colis/update', requireAdmin, async (req, res) => {
     if (b.largeur != null && b.largeur !== '') patch.largeur = b.largeur;
     if (b.hauteur != null && b.hauteur !== '') patch.hauteur = b.hauteur;
     if (b.photo_url) patch.photo_url = b.photo_url;
+    if (b.signature_url) patch.signature_url = b.signature_url;
     if (b.frais_envoi != null && b.frais_envoi !== '') patch.frais_envoi = b.frais_envoi;
     if (b.statut === 'recu') patch.received_at = new Date().toISOString();
     // Statut avant mise à jour (pour notifier seulement si changement réel).
