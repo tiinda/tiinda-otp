@@ -35,6 +35,8 @@ const {
   MAIL_FROM,                   // expéditeur, ex: "Tiinda <noreply@tiinda.com>"
   TRACK123_API_KEY,            // clé API Track123 (suivi colis) — optionnel
   ADMIN_TOKEN,                 // mot de passe du panneau Admin Tiinda
+  SESSION_SECRET,              // secret pour signer les tokens de session client
+  ALLOWED_ORIGINS,             // domaines autorisés (CORS), séparés par des virgules
   PORT = 3000,
 } = process.env;
 
@@ -47,15 +49,77 @@ const db = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
 
 const app = express();
 app.use(express.json());
+app.set('trust proxy', true);
 
-/* ── 0) CORS — autorise le thème Shopify à appeler ce backend directement ── */
+/* ── 0) CORS — restreint aux domaines Tiinda (plus de '*' ouvert à tous) ─────
+   On autorise : la liste ALLOWED_ORIGINS (env), tiinda.com / www.tiinda.com par
+   défaut, et tout sous-domaine *.myshopify.com (preview/boutique Shopify).
+   Le token de session reste la vraie barrière d'authentification ; le CORS
+   réduit la surface d'abus depuis d'autres sites. */
+const CORS_LIST = (ALLOWED_ORIGINS || 'https://tiinda.com,https://www.tiinda.com')
+  .split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+function originAllowed(origin) {
+  if (!origin) return false;
+  if (CORS_LIST.indexOf(origin) >= 0) return true;
+  try { var h = new URL(origin).hostname; return /\.myshopify\.com$/.test(h) || h === 'tiinda.com' || h === 'www.tiinda.com'; }
+  catch (e) { return false; }
+}
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin;
+  if (originAllowed(origin)) { res.header('Access-Control-Allow-Origin', origin); res.header('Vary', 'Origin'); }
   res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-token');
+  res.header('Access-Control-Max-Age', '86400');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
+
+/* ── 0b) TOKENS DE SESSION CLIENT (HMAC, sans librairie externe) ────────────
+   Après un OTP valide, on émet un token signé contenant le téléphone + une
+   expiration. Les routes client en déduisent le téléphone — on ne fait JAMAIS
+   confiance à un ?phone= brut. */
+const SESSION_KEY = SESSION_SECRET
+  || (SUPABASE_SERVICE_KEY ? crypto.createHash('sha256').update('tiinda::' + SUPABASE_SERVICE_KEY).digest('hex') : 'dev-secret-change-me');
+const SESSION_TTL_MS = 30 * 86400000; // 30 jours
+function b64url(buf) { return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+function signSession(phone) {
+  const payload = b64url(JSON.stringify({ p: phone, exp: Date.now() + SESSION_TTL_MS }));
+  const sig = b64url(crypto.createHmac('sha256', SESSION_KEY).update(payload).digest());
+  return payload + '.' + sig;
+}
+function verifySession(tokenRaw) {
+  if (!tokenRaw || typeof tokenRaw !== 'string' || tokenRaw.indexOf('.') < 0) return null;
+  const parts = tokenRaw.split('.');
+  const expected = b64url(crypto.createHmac('sha256', SESSION_KEY).update(parts[0]).digest());
+  if (!parts[1] || parts[1].length !== expected.length) return null;
+  try { if (!crypto.timingSafeEqual(Buffer.from(parts[1]), Buffer.from(expected))) return null; } catch (e) { return null; }
+  let data; try { data = JSON.parse(Buffer.from(parts[0].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString()); } catch (e) { return null; }
+  if (!data || !data.p || !data.exp || Date.now() > data.exp) return null;
+  return data.p;
+}
+// Middleware : exige un token de session valide ; expose req.clientPhone.
+function requireAuth(req, res, next) {
+  const h = req.headers['authorization'] || '';
+  const token = h.indexOf('Bearer ') === 0 ? h.slice(7) : (req.query.token || (req.body && req.body.token));
+  const phone = verifySession(token);
+  if (!phone) return res.status(401).json({ ok: false, error: 'unauthenticated' });
+  req.clientPhone = phone;
+  next();
+}
+
+/* ── 0c) RATE LIMITING simple en mémoire (anti-abus / anti-brute force) ───── */
+const rateBuckets = new Map();
+function clientIp(req) { return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || (req.socket && req.socket.remoteAddress) || 'unknown'; }
+function rateLimit(key, max, windowMs) {
+  const now = Date.now();
+  const arr = (rateBuckets.get(key) || []).filter(function (t) { return now - t < windowMs; });
+  if (arr.length >= max) { rateBuckets.set(key, arr); return false; }
+  arr.push(now); rateBuckets.set(key, arr); return true;
+}
+setInterval(function () { // purge périodique des compteurs expirés
+  const now = Date.now();
+  rateBuckets.forEach(function (arr, k) { const f = arr.filter(function (t) { return now - t < 3600000; }); if (f.length) rateBuckets.set(k, f); else rateBuckets.delete(k); });
+}, 600000);
 
 /* ── 1) Vérification de la signature Shopify App Proxy ─────────────────────
    (court-circuitée avec SKIP_PROXY_CHECK=1 quand on appelle le backend en
@@ -126,6 +190,7 @@ async function getOrCreateClient(phone, info = {}) {
 /* ── 4) Route : envoi du code (WhatsApp ou SMS selon OTP_CHANNEL) ────────── */
 app.post('/send', verifyShopifyProxy, async (req, res) => {
   try {
+    if (!rateLimit('send:' + clientIp(req), 8, 600000)) return res.status(429).json({ ok: false, error: 'too_many_requests' });
     const phone = toE164(req.body.phone);
     if (!phone || phone.length < 8) return res.status(400).json({ ok: false, error: 'invalid phone' });
     await client.verify.v2.services(TWILIO_VERIFY_SERVICE_SID)
@@ -140,6 +205,7 @@ app.post('/send', verifyShopifyProxy, async (req, res) => {
 /* ── 5) Route : vérification du code + création du client dans Supabase ──── */
 app.post('/verify', verifyShopifyProxy, async (req, res) => {
   try {
+    if (!rateLimit('verify:' + clientIp(req), 20, 600000)) return res.status(429).json({ ok: false, error: 'too_many_requests' });
     const phone = toE164(req.body.phone);
     const code = String(req.body.code || '').replace(/\D/g, '');
     if (!phone || code.length !== 6) return res.status(400).json({ ok: false, error: 'invalid_input' });
@@ -160,6 +226,7 @@ app.post('/verify', verifyShopifyProxy, async (req, res) => {
 
     res.json({
       ok: true,
+      token: signSession(phone),   // ← token de session signé (à stocker côté client)
       client: record ? {
         tiinda_id: record.tiinda_id,
         prenom: record.prenom, nom: record.nom,
@@ -174,10 +241,10 @@ app.post('/verify', verifyShopifyProxy, async (req, res) => {
 });
 
 /* ── 6) Route : récupérer un client par téléphone (pour la connexion) ────── */
-app.get('/client', async (req, res) => {
+app.get('/client', requireAuth, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
-    const phone = toE164(req.query.phone);
+    const phone = req.clientPhone;
     const { data } = await db.from('clients').select('*').eq('phone', phone).limit(1).maybeSingle();
     if (!data) return res.json({ ok: false, error: 'not_found' });
     res.json({ ok: true, client: {
@@ -235,10 +302,10 @@ async function sendDeclarationEmail(client, colis) {
 
 /* ── 7) Route : déclarer un colis ─────────────────────────────────────────
    Génère un numéro de suivi interne unique (TND + horodatage). */
-app.post('/colis/declare', async (req, res) => {
+app.post('/colis/declare', requireAuth, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
-    const phone = toE164(req.body.phone);
+    const phone = req.clientPhone;
     const { data: cli } = await db.from('clients').select('id, email, prenom, tiinda_id').eq('phone', phone).limit(1).maybeSingle();
     if (!cli) return res.json({ ok: false, error: 'client_not_found' });
 
@@ -267,10 +334,10 @@ app.post('/colis/declare', async (req, res) => {
 });
 
 /* ── 8) Route : lister les colis d'un client ──────────────────────────────── */
-app.get('/colis', async (req, res) => {
+app.get('/colis', requireAuth, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
-    const phone = toE164(req.query.phone);
+    const phone = req.clientPhone;
     const { data: cli } = await db.from('clients').select('id').eq('phone', phone).limit(1).maybeSingle();
     if (!cli) return res.json({ ok: false, error: 'client_not_found' });
     const { data } = await db.from('colis').select('*')
@@ -365,14 +432,16 @@ function extractTrack(raw, trackNo) {
 }
 
 /* ── Route : suivi d'un colis (par n° interne TND ou n° transporteur) ─────── */
-app.get('/track', async (req, res) => {
+app.get('/track', requireAuth, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
     const q = String(req.query.q || '').trim().replace(/[^A-Za-z0-9\-]/g, '');
     if (!q) return res.json({ ok: false, error: 'missing_query' });
-    // Retrouve le colis par n° interne Tiinda (TND…) OU n° transporteur.
-    // → taper le numéro Tiinda suffit : il est relié au n° transporteur déclaré.
+    // Le colis doit appartenir au client connecté (sécurité).
+    const { data: cli } = await db.from('clients').select('id').eq('phone', req.clientPhone).limit(1).maybeSingle();
+    if (!cli) return res.json({ ok: false, error: 'client_not_found' });
     let { data: colis } = await db.from('colis').select('*')
+      .eq('client_id', cli.id)
       .or('tracking_interne.eq.' + q + ',tracking_externe.eq.' + q).limit(1).maybeSingle();
     if (!colis) return res.json({ ok: false, error: 'not_found' });
     const carrierNo = colis.tracking_externe;
@@ -396,10 +465,14 @@ app.get('/track', async (req, res) => {
 app.get('/health', (_req, res) => res.json({ ok: true, db: !!db, track123: !!TRACK123_API_KEY }));
 
 /* ── 10) PANNEAU ADMIN (équipe Tiinda) ─────────────────────────────────────
-   Protégé par ADMIN_TOKEN (query ?token= ou header x-admin-token). */
+   Protégé par ADMIN_TOKEN — transmis UNIQUEMENT via le header x-admin-token
+   (plus jamais dans l'URL, pour ne pas fuiter dans les logs/historique). */
 function requireAdmin(req, res, next) {
-  const token = req.query.token || req.headers['x-admin-token'];
-  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  const token = req.headers['x-admin-token'];
+  if (!ADMIN_TOKEN || !token) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  const a = Buffer.from(String(token));
+  const b = Buffer.from(String(ADMIN_TOKEN));
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ ok: false, error: 'unauthorized' });
   next();
 }
 
@@ -488,10 +561,10 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
 });
 
 // Présence « en ligne » : le tableau de bord client appelle ceci périodiquement.
-app.get('/presence', async (req, res) => {
+app.get('/presence', requireAuth, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false });
-    const phone = toE164(req.query.phone);
+    const phone = req.clientPhone;
     if (phone) await db.from('clients').update({ last_seen: new Date().toISOString() }).eq('phone', phone);
     res.json({ ok: true });
   } catch (e) { res.json({ ok: false }); }
@@ -514,10 +587,10 @@ async function creditWallet(clientId, montant, moyen, code) {
 }
 
 // Solde + historique de recharges d'un client.
-app.get('/wallet', async (req, res) => {
+app.get('/wallet', requireAuth, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
-    const phone = toE164(req.query.phone);
+    const phone = req.clientPhone;
     const { data: cli } = await db.from('clients').select('id, wallet_balance').eq('phone', phone).limit(1).maybeSingle();
     if (!cli) return res.json({ ok: false, error: 'client_not_found' });
     const { data: hist } = await db.from('recharges').select('*').eq('client_id', cli.id).order('created_at', { ascending: false }).limit(50);
@@ -529,10 +602,11 @@ app.get('/wallet', async (req, res) => {
 });
 
 // Utiliser un code de recharge → crédite le wallet.
-app.post('/wallet/redeem', async (req, res) => {
+app.post('/wallet/redeem', requireAuth, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
-    const phone = toE164(req.body.phone);
+    if (!rateLimit('redeem:' + clientIp(req), 15, 600000)) return res.status(429).json({ ok: false, error: 'too_many_requests' });
+    const phone = req.clientPhone;
     const code = String(req.body.code || '').trim().toUpperCase().replace(/[^A-Z0-9\-]/g, '');
     if (!code) return res.json({ ok: false, error: 'missing_code' });
     const { data: cli } = await db.from('clients').select('id').eq('phone', phone).limit(1).maybeSingle();
