@@ -219,6 +219,12 @@ async function getOrCreateClient(phone, info = {}) {
   };
   // Mot de passe (pour la connexion email + mot de passe).
   if (info.password) insert.password_hash = hashPassword(info.password);
+  // Parrainage : si un code parrain valide est fourni, on le relie.
+  if (info.ref) {
+    const refCode = String(info.ref).trim().toUpperCase();
+    const { data: parrain } = await db.from('clients').select('id').eq('tiinda_id', refCode).limit(1).maybeSingle();
+    if (parrain) insert.parrain_id = parrain.id;
+  }
   const { data: created, error } = await db.from('clients').insert(insert).select().single();
   if (error) { console.error('create client error:', error.message); return null; }
   return created;
@@ -260,6 +266,7 @@ app.post('/verify', verifyShopifyProxy, async (req, res) => {
       ville:  req.body.ville,
       offre:  req.body.offre,
       password: req.body.password,
+      ref: req.body.ref,
     });
 
     res.json({
@@ -457,7 +464,7 @@ app.post('/colis/declare', requireAuth, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
     const phone = req.clientPhone;
-    const { data: cli } = await db.from('clients').select('id, email, prenom, tiinda_id').eq('phone', phone).limit(1).maybeSingle();
+    const { data: cli } = await db.from('clients').select('id, email, prenom, tiinda_id, parrain_id').eq('phone', phone).limit(1).maybeSingle();
     if (!cli) return res.json({ ok: false, error: 'client_not_found' });
 
     const tracking_interne = 'TND' + Date.now().toString().slice(-9);
@@ -476,6 +483,21 @@ app.post('/colis/declare', requireAuth, async (req, res) => {
     sendDeclarationEmail(cli, data);
     // Enregistre le n° transporteur chez Track123 pour le suivi automatique.
     if (data.tracking_externe) track123Import(data.tracking_externe);
+    // Récompense parrainage : au 1er colis du filleul, on crédite son parrain de 5 €.
+    if (cli.parrain_id) {
+      (async function () {
+        try {
+          const { count } = await db.from('colis').select('id', { count: 'exact', head: true }).eq('client_id', cli.id);
+          if (count === 1) {
+            const { data: p } = await db.from('clients').select('wallet_balance').eq('id', cli.parrain_id).maybeSingle();
+            if (p) {
+              await db.from('clients').update({ wallet_balance: Number(p.wallet_balance || 0) + 5 }).eq('id', cli.parrain_id);
+              await db.from('recharges').insert({ client_id: cli.parrain_id, montant: 5, moyen: 'parrainage', statut: 'valide' });
+            }
+          }
+        } catch (e) { console.error('referral reward error:', e.message); }
+      })();
+    }
 
     res.json({ ok: true, colis: data });
   } catch (err) {
@@ -900,6 +922,31 @@ app.post('/password/change', requireAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('password change error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// Programme de parrainage : code, lien, filleuls, récompenses gagnées.
+app.get('/referral', requireAuth, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data: me } = await db.from('clients').select('id, tiinda_id').eq('phone', req.clientPhone).limit(1).maybeSingle();
+    if (!me) return res.json({ ok: false, error: 'not_found' });
+    const base = (process.env.SITE_URL || 'https://tiinda.com');
+    const { data: filleuls } = await db.from('clients').select('prenom, nom, created_at, id').eq('parrain_id', me.id).order('created_at', { ascending: false });
+    // Récompenses parrainage déjà créditées (tracées dans recharges, moyen='parrainage').
+    const { data: recs } = await db.from('recharges').select('montant').eq('client_id', me.id).eq('moyen', 'parrainage');
+    let gains = 0; (recs || []).forEach(function (r) { gains += Number(r.montant || 0); });
+    res.json({
+      ok: true,
+      code: me.tiinda_id,
+      link: base + '/?ref=' + me.tiinda_id,
+      count: (filleuls || []).length,
+      gains: gains,
+      filleuls: (filleuls || []).map(function (f) { return { nom: ((f.prenom || '') + ' ' + (f.nom || '')).trim(), date: f.created_at }; }),
+    });
+  } catch (err) {
+    console.error('referral error:', err.message);
     res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
