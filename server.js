@@ -856,8 +856,8 @@ async function creditWallet(clientId, montant, moyen, code) {
 app.get('/prefs', requireAuth, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
-    const { data } = await db.from('clients').select('notif_email, notif_sms, notif_whatsapp').eq('phone', req.clientPhone).limit(1).maybeSingle();
-    res.json({ ok: true, prefs: data || { notif_email: true, notif_sms: false, notif_whatsapp: true } });
+    const { data } = await db.from('clients').select('notif_email, notif_sms, notif_whatsapp, twofa').eq('phone', req.clientPhone).limit(1).maybeSingle();
+    res.json({ ok: true, prefs: data || { notif_email: true, notif_sms: false, notif_whatsapp: true, twofa: false } });
   } catch (err) {
     console.error('prefs get error:', err.message);
     res.status(500).json({ ok: false, error: 'server_error' });
@@ -869,14 +869,37 @@ app.post('/prefs', requireAuth, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
     const b = req.body || {};
-    await db.from('clients').update({
-      notif_email: !!b.notif_email,
-      notif_sms: !!b.notif_sms,
-      notif_whatsapp: !!b.notif_whatsapp,
-    }).eq('phone', req.clientPhone);
+    // On ne met à jour QUE les champs présents (évite d'écraser les autres).
+    const patch = {};
+    if ('notif_email' in b) patch.notif_email = !!b.notif_email;
+    if ('notif_sms' in b) patch.notif_sms = !!b.notif_sms;
+    if ('notif_whatsapp' in b) patch.notif_whatsapp = !!b.notif_whatsapp;
+    if ('twofa' in b) patch.twofa = !!b.twofa;
+    if (Object.keys(patch).length) await db.from('clients').update(patch).eq('phone', req.clientPhone);
     res.json({ ok: true });
   } catch (err) {
     console.error('prefs set error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// Changement de mot de passe (client connecté) : vérifie l'ancien, pose le nouveau.
+app.post('/password/change', requireAuth, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const oldPw = String(req.body.old_password || '');
+    const newPw = String(req.body.new_password || '');
+    if (newPw.length < 8) return res.json({ ok: false, error: 'too_short' });
+    const { data: cli } = await db.from('clients').select('id, password_hash').eq('phone', req.clientPhone).limit(1).maybeSingle();
+    if (!cli) return res.json({ ok: false, error: 'not_found' });
+    // Si un mot de passe existe déjà, on exige l'ancien correct.
+    if (cli.password_hash && !verifyPassword(oldPw, cli.password_hash)) {
+      return res.json({ ok: false, error: 'wrong_password' });
+    }
+    await db.from('clients').update({ password_hash: hashPassword(newPw) }).eq('id', cli.id);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('password change error:', err.message);
     res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
