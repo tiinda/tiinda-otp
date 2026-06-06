@@ -462,6 +462,31 @@ app.get('/track', requireAuth, async (req, res) => {
   }
 });
 
+/* ── Route : vérifie si un compte existe déjà (par téléphone ou email) ──────
+   Utilisé à l'inscription pour bloquer les doublons et orienter vers la
+   connexion. Rate-limité pour limiter l'énumération de comptes. */
+app.get('/exists', async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false });
+    if (!rateLimit('exists:' + clientIp(req), 30, 600000)) return res.status(429).json({ ok: false, error: 'too_many_requests' });
+    const phone = toE164(req.query.phone || '');
+    const email = String(req.query.email || '').trim().toLowerCase();
+    let phoneExists = false, emailExists = false;
+    if (phone && phone.length > 5) {
+      const { data } = await db.from('clients').select('id').eq('phone', phone).limit(1);
+      phoneExists = !!(data && data.length);
+    }
+    if (email) {
+      const { data } = await db.from('clients').select('id').ilike('email', email).limit(1);
+      emailExists = !!(data && data.length);
+    }
+    res.json({ ok: true, phoneExists: phoneExists, emailExists: emailExists });
+  } catch (e) {
+    console.error('exists error:', e.message);
+    res.json({ ok: false });
+  }
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true, db: !!db, track123: !!TRACK123_API_KEY }));
 
 /* ── 10) PANNEAU ADMIN (équipe Tiinda) ─────────────────────────────────────
