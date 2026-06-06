@@ -357,9 +357,33 @@ app.post('/password/reset', async (req, res) => {
     const password = String(req.body.password || '');
     if (!email) return res.json({ ok: false, error: 'lien_invalide' });
     if (password.length < 8) return res.json({ ok: false, error: 'mot_de_passe_court' });
-    const { data: cli } = await db.from('clients').select('id').ilike('email', email).limit(1).maybeSingle();
+    const { data: cli } = await db.from('clients').select('id, prenom, email').ilike('email', email).limit(1).maybeSingle();
     if (!cli) return res.json({ ok: false, error: 'compte_introuvable' });
-    await db.from('clients').update({ password_hash: hashPassword(password) }).eq('id', cli.id);
+    const newHash = hashPassword(password);
+    // Met à jour TOUTES les lignes de cet email (au cas où des doublons existent),
+    // pour que la connexion fonctionne quelle que soit la ligne lue ensuite.
+    await db.from('clients').update({ password_hash: newHash }).ilike('email', email);
+    // Email de confirmation (ne bloque pas la réponse).
+    if (RESEND_API_KEY && cli.email) {
+      const html =
+        '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:auto;color:#1a1a1a">' +
+          '<div style="background:#0057FF;color:#fff;padding:20px;border-radius:12px 12px 0 0;text-align:center">' +
+            '<div style="font-size:21px;font-weight:800">TIINDA</div><div style="font-size:13px;opacity:.85">Mot de passe modifié</div></div>' +
+          '<div style="border:1px solid #eee;border-top:none;padding:24px;border-radius:0 0 12px 12px">' +
+            '<p>Bonjour ' + (cli.prenom || '') + ',</p>' +
+            '<p>✅ Votre mot de passe Tiinda vient d\u2019être <strong>modifié avec succès</strong>.</p>' +
+            '<p>Vous pouvez désormais vous connecter avec votre nouveau mot de passe.</p>' +
+            '<p style="font-size:12.5px;color:#666">Si vous n\u2019êtes pas à l\u2019origine de ce changement, contactez-nous immédiatement via l\u2019assistance WhatsApp.</p>' +
+            '<p style="margin-top:18px">L\u2019équipe Tiinda</p>' +
+          '</div></div>';
+      try {
+        await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ from: MAIL_FROM || 'Tiinda <onboarding@resend.dev>', to: cli.email, subject: 'Tiinda — Votre mot de passe a été modifié ✓', html }),
+        });
+      } catch (e) { console.error('reset confirm mail error:', e.message); }
+    }
     res.json({ ok: true });
   } catch (err) {
     console.error('reset error:', err.message);
