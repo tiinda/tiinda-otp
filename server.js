@@ -762,6 +762,35 @@ async function creditWallet(clientId, montant, moyen, code) {
   return newBal;
 }
 
+// Préférences de notification : charger.
+app.get('/prefs', requireAuth, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data } = await db.from('clients').select('notif_email, notif_sms, notif_whatsapp').eq('phone', req.clientPhone).limit(1).maybeSingle();
+    res.json({ ok: true, prefs: data || { notif_email: true, notif_sms: false, notif_whatsapp: true } });
+  } catch (err) {
+    console.error('prefs get error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// Préférences de notification : enregistrer.
+app.post('/prefs', requireAuth, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const b = req.body || {};
+    await db.from('clients').update({
+      notif_email: !!b.notif_email,
+      notif_sms: !!b.notif_sms,
+      notif_whatsapp: !!b.notif_whatsapp,
+    }).eq('phone', req.clientPhone);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('prefs set error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 // Solde + historique de recharges d'un client.
 app.get('/wallet', requireAuth, async (req, res) => {
   try {
