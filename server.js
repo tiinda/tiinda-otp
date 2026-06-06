@@ -681,11 +681,17 @@ async function notifyColisStatus(clientId, colis) {
   const action = STATUT_MSG[colis.statut] || ('a changé de statut : ' + colis.statut);
   const ref = colis.tracking_interne || '';
   const text = 'Tiinda : votre colis ' + ref + ' ' + action + '.';
-  // WhatsApp (gratuit) via Twilio Verify n'envoie pas de texte libre → on tente
-  // l'API Messages si un numéro WhatsApp d'envoi est configuré ; sinon on ignore.
+  // WhatsApp via template approuvé « tiinda_colis_update » (3 variables :
+  // prénom, n° colis, statut). Envoi proactif autorisé par Meta.
+  const WA_TEMPLATE_SID = process.env.TWILIO_WA_TEMPLATE_SID || 'HX2ba4d551cab40767d458174204aff69e';
   if (cli.notif_whatsapp && process.env.TWILIO_WHATSAPP_FROM) {
     try {
-      await client.messages.create({ from: 'whatsapp:' + process.env.TWILIO_WHATSAPP_FROM, to: 'whatsapp:' + cli.phone, body: text });
+      await client.messages.create({
+        from: 'whatsapp:' + process.env.TWILIO_WHATSAPP_FROM,
+        to: 'whatsapp:' + cli.phone,
+        contentSid: WA_TEMPLATE_SID,
+        contentVariables: JSON.stringify({ '1': cli.prenom || 'cher client', '2': ref, '3': action }),
+      });
     } catch (e) { console.error('notif wa error:', e.message); }
   }
   // SMS (payant : 0,10 € débité du wallet si solde suffisant)
