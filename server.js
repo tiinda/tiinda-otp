@@ -107,6 +107,40 @@ function requireAuth(req, res, next) {
   next();
 }
 
+/* ── Hachage de mot de passe (pbkdf2, sans librairie externe) ───────────── */
+function hashPassword(pw) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(String(pw), salt, 120000, 32, 'sha256').toString('hex');
+  return 'pbkdf2$120000$' + salt + '$' + hash;
+}
+function verifyPassword(pw, stored) {
+  if (!stored || typeof stored !== 'string') return false;
+  const parts = stored.split('$');
+  if (parts.length !== 4 || parts[0] !== 'pbkdf2') return false;
+  const iter = parseInt(parts[1], 10), salt = parts[2], expected = parts[3];
+  const hash = crypto.pbkdf2Sync(String(pw), salt, iter, 32, 'sha256').toString('hex');
+  try { return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(expected)); } catch (e) { return false; }
+}
+
+/* ── Jetons de réinitialisation de mot de passe (signés, courte durée) ──────
+   Contient l'email + une expiration (1h). Envoyé par email uniquement. */
+const RESET_TTL_MS = 60 * 60000; // 1 heure
+function signReset(email) {
+  const payload = b64url(JSON.stringify({ e: email, exp: Date.now() + RESET_TTL_MS, t: 'reset' }));
+  const sig = b64url(crypto.createHmac('sha256', SESSION_KEY).update('reset:' + payload).digest());
+  return payload + '.' + sig;
+}
+function verifyReset(tokenRaw) {
+  if (!tokenRaw || typeof tokenRaw !== 'string' || tokenRaw.indexOf('.') < 0) return null;
+  const parts = tokenRaw.split('.');
+  const expected = b64url(crypto.createHmac('sha256', SESSION_KEY).update('reset:' + parts[0]).digest());
+  if (!parts[1] || parts[1].length !== expected.length) return null;
+  try { if (!crypto.timingSafeEqual(Buffer.from(parts[1]), Buffer.from(expected))) return null; } catch (e) { return null; }
+  let data; try { data = JSON.parse(Buffer.from(parts[0].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString()); } catch (e) { return null; }
+  if (!data || !data.e || data.t !== 'reset' || !data.exp || Date.now() > data.exp) return null;
+  return data.e;
+}
+
 /* ── 0c) RATE LIMITING simple en mémoire (anti-abus / anti-brute force) ───── */
 const rateBuckets = new Map();
 function clientIp(req) { return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || (req.socket && req.socket.remoteAddress) || 'unknown'; }
@@ -174,15 +208,18 @@ async function getOrCreateClient(phone, info = {}) {
   if (existing) return existing;
   // Sinon on le crée avec un identifiant unique.
   const tiinda_id = await nextTiindaId();
-  const { data: created, error } = await db.from('clients').insert({
+  const insert = {
     tiinda_id,
     prenom: info.prenom || null,
     nom:    info.nom || null,
-    email:  info.email || null,
+    email:  info.email ? String(info.email).trim().toLowerCase() : null,
     phone,
     ville:  info.ville || null,
     offre:  info.offre || null,
-  }).select().single();
+  };
+  // Mot de passe (pour la connexion email + mot de passe).
+  if (info.password) insert.password_hash = hashPassword(info.password);
+  const { data: created, error } = await db.from('clients').insert(insert).select().single();
   if (error) { console.error('create client error:', error.message); return null; }
   return created;
 }
@@ -222,6 +259,7 @@ app.post('/verify', verifyShopifyProxy, async (req, res) => {
       email:  req.body.email,
       ville:  req.body.ville,
       offre:  req.body.offre,
+      password: req.body.password,
     });
 
     res.json({
@@ -237,6 +275,95 @@ app.post('/verify', verifyShopifyProxy, async (req, res) => {
   } catch (err) {
     console.error('verify error:', err.message);
     res.status(200).json({ ok: false, error: 'verify_failed' });
+  }
+});
+
+/* ── Route : connexion par EMAIL + MOT DE PASSE ────────────────────────────
+   Le téléphone reste réservé à l'inscription (collecte des vrais numéros).
+   Retourne un token de session signé + les infos du client. */
+app.post('/login', async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    if (!rateLimit('login:' + clientIp(req), 12, 600000)) return res.status(429).json({ ok: false, error: 'too_many_requests' });
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const password = String(req.body.password || '');
+    if (!email || !password) return res.json({ ok: false, error: 'missing' });
+    const { data: cli } = await db.from('clients').select('*').ilike('email', email).limit(1).maybeSingle();
+    // Message générique (ne révèle pas si l'email existe) pour la sécurité.
+    if (!cli || !cli.password_hash || !verifyPassword(password, cli.password_hash)) {
+      return res.json({ ok: false, error: 'invalid_credentials' });
+    }
+    res.json({
+      ok: true,
+      token: signSession(cli.phone),
+      client: {
+        tiinda_id: cli.tiinda_id, prenom: cli.prenom, nom: cli.nom,
+        email: cli.email, phone: cli.phone, ville: cli.ville,
+        offre: cli.offre, wallet_balance: cli.wallet_balance,
+      },
+    });
+  } catch (err) {
+    console.error('login error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+/* ── Mot de passe oublié : envoi d'un lien de réinitialisation par EMAIL ────
+   Réponse toujours générique (on ne révèle pas si l'email existe). */
+app.post('/password/forgot', async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: true });
+    if (!rateLimit('forgot:' + clientIp(req), 6, 600000)) return res.status(429).json({ ok: false, error: 'too_many_requests' });
+    const email = String(req.body.email || '').trim().toLowerCase();
+    if (email) {
+      const { data: cli } = await db.from('clients').select('id, prenom, email').ilike('email', email).limit(1).maybeSingle();
+      if (cli && cli.email && RESEND_API_KEY) {
+        const tokenR = signReset(cli.email);
+        const base = (process.env.SITE_URL || 'https://tiinda.com');
+        const link = base + '/pages/reinitialiser-mot-de-passe?token=' + encodeURIComponent(tokenR);
+        const html =
+          '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:auto;color:#1a1a1a">' +
+            '<div style="background:#0057FF;color:#fff;padding:20px;border-radius:12px 12px 0 0;text-align:center">' +
+              '<div style="font-size:21px;font-weight:800">TIINDA</div><div style="font-size:13px;opacity:.85">Réinitialisation du mot de passe</div></div>' +
+            '<div style="border:1px solid #eee;border-top:none;padding:24px;border-radius:0 0 12px 12px">' +
+              '<p>Bonjour ' + (cli.prenom || '') + ',</p>' +
+              '<p>Vous avez demandé à réinitialiser votre mot de passe Tiinda. Cliquez sur le bouton ci-dessous (lien valable 1&nbsp;heure) :</p>' +
+              '<p style="text-align:center;margin:24px 0"><a href="' + link + '" style="background:#0057FF;color:#fff;text-decoration:none;padding:13px 26px;border-radius:10px;font-weight:700;display:inline-block">Définir un nouveau mot de passe</a></p>' +
+              '<p style="font-size:12.5px;color:#666">Si vous n\u2019êtes pas à l\u2019origine de cette demande, ignorez cet email : votre mot de passe restera inchangé.</p>' +
+              '<p style="font-size:12px;color:#999;word-break:break-all">Ou copiez ce lien : ' + link + '</p>' +
+            '</div></div>';
+        try {
+          await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ from: MAIL_FROM || 'Tiinda <onboarding@resend.dev>', to: cli.email, subject: 'Tiinda — Réinitialisation de votre mot de passe', html }),
+          });
+        } catch (e) { console.error('forgot mail error:', e.message); }
+      }
+    }
+    res.json({ ok: true }); // toujours générique
+  } catch (err) {
+    console.error('forgot error:', err.message);
+    res.json({ ok: true });
+  }
+});
+
+/* ── Réinitialisation effective : token (du lien email) + nouveau mot de passe */
+app.post('/password/reset', async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    if (!rateLimit('reset:' + clientIp(req), 12, 600000)) return res.status(429).json({ ok: false, error: 'too_many_requests' });
+    const email = verifyReset(req.body.token);
+    const password = String(req.body.password || '');
+    if (!email) return res.json({ ok: false, error: 'lien_invalide' });
+    if (password.length < 8) return res.json({ ok: false, error: 'mot_de_passe_court' });
+    const { data: cli } = await db.from('clients').select('id').ilike('email', email).limit(1).maybeSingle();
+    if (!cli) return res.json({ ok: false, error: 'compte_introuvable' });
+    await db.from('clients').update({ password_hash: hashPassword(password) }).eq('id', cli.id);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('reset error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
 
