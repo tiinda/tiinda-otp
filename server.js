@@ -764,7 +764,7 @@ app.post('/chat', async (req, res) => {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'claude-3-5-haiku-latest', max_tokens: 500, system: TIINDA_SYSTEM, messages: clean }),
+      body: JSON.stringify({ model: 'claude-3-5-haiku-20241022', max_tokens: 500, system: TIINDA_SYSTEM, messages: clean }),
     });
     const data = await r.json();
     if (!r.ok) { console.error('chat error:', r.status, JSON.stringify(data).slice(0, 300)); return res.json({ ok: false, error: 'ia_error' }); }
