@@ -1310,6 +1310,46 @@ app.get('/admin/codes', requireAdmin, async (req, res) => {
   }
 });
 
+// ── POINTS RELAIS ────────────────────────────────────────────────────────
+// (PUBLIC) Liste des points relais actifs (affichés côté client).
+app.get('/points-relais', async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data } = await db.from('points_relais').select('*').eq('actif', true).order('created_at', { ascending: true });
+    res.json({ ok: true, points: data || [] });
+  } catch (e) { console.error('points get error:', e.message); res.json({ ok: false }); }
+});
+// (ADMIN) Liste complète.
+app.get('/admin/points-relais', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data } = await db.from('points_relais').select('*').order('created_at', { ascending: true });
+    res.json({ ok: true, points: data || [] });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+// (ADMIN) Créer / modifier.
+app.post('/admin/points-relais/save', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const b = req.body || {};
+    const row = { nom: b.nom || null, adresse: b.adresse || null, ville: b.ville || null, horaires: b.horaires || null, actif: b.actif !== false };
+    let data, error;
+    if (b.id) { ({ data, error } = await db.from('points_relais').update(row).eq('id', b.id).select().single()); }
+    else { ({ data, error } = await db.from('points_relais').insert(row).select().single()); }
+    if (error) { console.error('points save error:', error.message); return res.json({ ok: false }); }
+    res.json({ ok: true, point: data });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+// (ADMIN) Supprimer.
+app.post('/admin/points-relais/delete', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    if (!req.body.id) return res.json({ ok: false });
+    await db.from('points_relais').delete().eq('id', req.body.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+
 // (ADMIN) Liste complète des clients : solde, formule, présence, CA, dernier achat.
 app.get('/admin/clients', requireAdmin, async (req, res) => {
   try {
