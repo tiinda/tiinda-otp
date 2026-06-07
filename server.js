@@ -1014,6 +1014,63 @@ app.get('/activity', requireAuth, async (req, res) => {
   }
 });
 
+// ── DEMANDES DE MODIFICATION DE PROFIL (validées par l'admin) ───────────────
+// Le client soumet une demande ; rien n'est appliqué tant que l'admin n'a pas validé.
+app.get('/profil/request', requireAuth, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data: cli } = await db.from('clients').select('id').eq('phone', req.clientPhone).limit(1).maybeSingle();
+    if (!cli) return res.json({ ok: false, error: 'not_found' });
+    const { data } = await db.from('profile_requests').select('id').eq('client_id', cli.id).eq('statut', 'en_attente').limit(1);
+    res.json({ ok: true, pending: !!(data && data.length) });
+  } catch (err) { console.error('profil get error:', err.message); res.status(500).json({ ok: false, error: 'server_error' }); }
+});
+app.post('/profil/request', requireAuth, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data: cli } = await db.from('clients').select('id').eq('phone', req.clientPhone).limit(1).maybeSingle();
+    if (!cli) return res.json({ ok: false, error: 'not_found' });
+    // Une seule demande en attente à la fois : on remplace l'ancienne.
+    await db.from('profile_requests').delete().eq('client_id', cli.id).eq('statut', 'en_attente');
+    const b = req.body || {};
+    const payload = { prenom: b.prenom, nom: b.nom, naissance: b.naissance, genre: b.genre, email: b.email, ville: b.ville, commune: b.commune, rue: b.rue, repere: b.repere };
+    const { error } = await db.from('profile_requests').insert({ client_id: cli.id, payload: payload, statut: 'en_attente' });
+    if (error) { console.error('profil insert error:', error.message); return res.json({ ok: false, error: 'insert_failed' }); }
+    res.json({ ok: true });
+  } catch (err) { console.error('profil post error:', err.message); res.status(500).json({ ok: false, error: 'server_error' }); }
+});
+// (ADMIN) Liste des demandes en attente.
+app.get('/admin/profil-requests', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data } = await db.from('profile_requests').select('*, clients(prenom,nom,tiinda_id,phone)').eq('statut', 'en_attente').order('created_at', { ascending: false });
+    res.json({ ok: true, requests: data || [] });
+  } catch (err) { console.error('admin profil list error:', err.message); res.status(500).json({ ok: false, error: 'server_error' }); }
+});
+// (ADMIN) Approuver (applique les changements) ou rejeter une demande.
+app.post('/admin/profil-requests/handle', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const b = req.body || {};
+    if (!b.id) return res.json({ ok: false, error: 'missing_id' });
+    const { data: reqRow } = await db.from('profile_requests').select('*').eq('id', b.id).maybeSingle();
+    if (!reqRow) return res.json({ ok: false, error: 'not_found' });
+    if (b.action === 'approve') {
+      const p = reqRow.payload || {};
+      const patch = {};
+      ['prenom','nom','email','ville'].forEach(function (k) { if (p[k]) patch[k] = p[k]; });
+      // Champs adresse/identité étendus (colonnes optionnelles).
+      ['naissance','genre','commune','rue','repere'].forEach(function (k) { if (p[k] != null) patch[k] = p[k]; });
+      if (patch.email) patch.email = String(patch.email).toLowerCase();
+      await db.from('clients').update(patch).eq('id', reqRow.client_id);
+      await db.from('profile_requests').update({ statut: 'approuvee' }).eq('id', b.id);
+    } else {
+      await db.from('profile_requests').update({ statut: 'rejetee' }).eq('id', b.id);
+    }
+    res.json({ ok: true });
+  } catch (err) { console.error('admin profil handle error:', err.message); res.status(500).json({ ok: false, error: 'server_error' }); }
+});
+
 // Programme de parrainage : code, lien, filleuls, récompenses gagnées.
 app.get('/referral', requireAuth, async (req, res) => {
   try {
