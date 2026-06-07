@@ -409,6 +409,8 @@ app.get('/client', requireAuth, async (req, res) => {
       tiinda_id: data.tiinda_id, prenom: data.prenom, nom: data.nom,
       email: data.email, phone: data.phone, ville: data.ville,
       offre: data.offre, wallet_balance: data.wallet_balance,
+      naissance: data.naissance, genre: data.genre,
+      commune: data.commune, rue: data.rue, repere: data.repere,
     }});
   } catch (err) {
     console.error('client error:', err.message);
