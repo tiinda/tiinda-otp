@@ -48,6 +48,45 @@ const db = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
   : null;
 
 const app = express();
+
+/* ── Webhook Shopify « commande payée » — crédit automatique du wallet ──────
+   Doit lire le corps BRUT (avant express.json) pour vérifier la signature HMAC.
+   Bonus : +5% sur 20 €, +10% sur 50 €. ───────────────────────────────────── */
+const CREDIT_BONUS = { 10: 0, 20: 0.05, 50: 0.10 };
+app.post('/webhook/order-paid', express.raw({ type: '*/*' }), async (req, res) => {
+  try {
+    const secret = process.env.SHOPIFY_WEBHOOK_SECRET || SHOPIFY_API_SECRET || '';
+    const hmac = req.headers['x-shopify-hmac-sha256'] || '';
+    const digest = crypto.createHmac('sha256', secret).update(req.body).digest('base64');
+    let okSig = false;
+    try { okSig = crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(String(hmac))); } catch (e) { okSig = false; }
+    if (!okSig) return res.status(401).send('bad hmac');
+    res.status(200).send('ok'); // on répond vite à Shopify
+    if (!db) return;
+    const order = JSON.parse(req.body.toString('utf8'));
+    const email = (order.email || (order.customer && order.customer.email) || '').trim().toLowerCase();
+    if (!email) return;
+    const { data: cli } = await db.from('clients').select('id, prenom, email, wallet_balance').ilike('email', email).limit(1).maybeSingle();
+    if (!cli) { console.error('webhook: client introuvable', email); return; }
+    let creditTotal = 0;
+    (order.line_items || []).forEach(function (it) {
+      const m = /credit[- ]?tiinda[- ]?(\d+)/i.exec((it.sku || '') + ' ' + (it.title || '') + ' ' + (it.handle || ''));
+      let base = 0;
+      if (m) base = Number(m[1]);
+      else { const p = Math.round(Number(it.price || 0)); if (CREDIT_BONUS[p] != null) base = p; }
+      if (base) creditTotal += base * (it.quantity || 1) * (1 + (CREDIT_BONUS[base] || 0));
+    });
+    if (creditTotal <= 0) return; // pas un achat de crédit
+    creditTotal = Math.round(creditTotal * 100) / 100;
+    const newBal = Number(cli.wallet_balance || 0) + creditTotal;
+    await db.from('clients').update({ wallet_balance: newBal }).eq('id', cli.id);
+    await db.from('recharges').insert({ client_id: cli.id, montant: creditTotal, moyen: 'carte', code_recharge: 'CMD-' + (order.order_number || order.id || ''), statut: 'valide' });
+    console.log('webhook: +' + creditTotal + ' € → ' + email + ' (solde ' + newBal + ')');
+  } catch (err) {
+    console.error('webhook order-paid error:', err.message);
+  }
+});
+
 app.use(express.json());
 app.set('trust proxy', true);
 
