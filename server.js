@@ -64,6 +64,8 @@ app.post('/webhook/order-paid', express.raw({ type: '*/*' }), async (req, res) =
     res.status(200).send('ok'); // on répond vite à Shopify
     if (!db) return;
     const order = JSON.parse(req.body.toString('utf8'));
+    // 🔒 Sécurité : on ignore les commandes de TEST (carte 4242…) → pas de crédit fictif.
+    if (order.test === true) { console.log('webhook: commande TEST ignorée'); return; }
     const email = (order.email || (order.customer && order.customer.email) || '').trim().toLowerCase();
     if (!email) return;
     const { data: cli } = await db.from('clients').select('id, prenom, email, wallet_balance').ilike('email', email).limit(1).maybeSingle();
