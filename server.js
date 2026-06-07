@@ -755,9 +755,11 @@ app.post('/admin/measure', requireScan, async (req, res) => {
     const b = req.body || {};
     const code = String(b.code || '').trim().toUpperCase().replace(/[^A-Z0-9\-]/g, '');
     if (!code) return res.json({ ok: false, error: 'missing' });
-    const { data: colis } = await db.from('colis').select('id, statut, client_id, tracking_interne')
+    const { data: colis } = await db.from('colis').select('id, statut, client_id, tracking_interne, received_at')
       .or('tracking_interne.eq.' + code + ',tracking_externe.eq.' + code).limit(1).maybeSingle();
     if (!colis) return res.json({ ok: false, error: 'colis_introuvable' });
+    // Bloque la double réception/mesure.
+    if (colis.statut === 'recu' || colis.received_at) return res.json({ ok: false, error: 'deja_mesure' });
     const num = function (x) { return (x === '' || x == null) ? null : Number(x); };
     const L = num(b.longueur), W = num(b.largeur), H = num(b.hauteur), kg = num(b.poids);
     // ── Calcul du prix d'expédition Congo (même formule que la calculette) ──
@@ -799,6 +801,8 @@ app.post('/admin/scan', requireScan, async (req, res) => {
     const { data: colis } = await db.from('colis').select('id, statut, client_id, tracking_interne, description')
       .or('tracking_interne.eq.' + code + ',tracking_externe.eq.' + code).limit(1).maybeSingle();
     if (!colis) return res.json({ ok: false, error: 'colis_introuvable' });
+    // Bloque le double scan : si déjà à ce statut, on prévient.
+    if (colis.statut === statut) return res.json({ ok: false, error: 'deja_scanne', statut: statut });
     const patch = { statut: statut };
     if (statut === 'recu') patch.received_at = new Date().toISOString();
     if (b.signature_url) patch.signature_url = b.signature_url;
