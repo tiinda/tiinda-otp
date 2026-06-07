@@ -748,6 +748,34 @@ async function notifyColisStatus(clientId, colis) {
   }
 }
 
+// Réception & mesure : enregistre type, dimensions, poids → transmis admin + client.
+app.post('/admin/measure', requireScan, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const b = req.body || {};
+    const code = String(b.code || '').trim().toUpperCase().replace(/[^A-Z0-9\-]/g, '');
+    if (!code) return res.json({ ok: false, error: 'missing' });
+    const { data: colis } = await db.from('colis').select('id, statut, client_id, tracking_interne')
+      .or('tracking_interne.eq.' + code + ',tracking_externe.eq.' + code).limit(1).maybeSingle();
+    if (!colis) return res.json({ ok: false, error: 'colis_introuvable' });
+    const num = function (x) { return (x === '' || x == null) ? null : Number(x); };
+    const patch = {
+      type_colis: b.type_colis || null,
+      longueur: num(b.longueur), largeur: num(b.largeur), hauteur: num(b.hauteur),
+      poids: num(b.poids), statut: 'recu', received_at: new Date().toISOString(),
+    };
+    if (b.description) patch.description = b.description;
+    const { data, error } = await db.from('colis').update(patch).eq('id', colis.id).select().single();
+    if (error) { console.error('measure error:', error.message); return res.json({ ok: false, error: 'update_failed' }); }
+    // Notifie le client (colis reçu + mesuré).
+    if (colis.statut !== 'recu') notifyColisStatus(colis.client_id, data).catch(function(){});
+    res.json({ ok: true, colis: data });
+  } catch (err) {
+    console.error('measure error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 // Scan entrepôt : trouve un colis par son numéro Tiinda (TND…) et met à jour
 // son statut en un seul appel. Notifie le client + stocke signature/photo.
 app.post('/admin/scan', requireScan, async (req, res) => {
