@@ -537,10 +537,20 @@ app.post('/colis/expedier', requireAuth, async (req, res) => {
     const { data: colis } = await db.from('colis').select('*').eq('client_id', cli.id).in('id', ids);
     const list = (colis || []).filter(function (c) { return c.statut === 'recu'; });
     if (!list.length) return res.json({ ok: false, error: 'aucun_colis_eligible' });
-    // Total = somme des frais (regroupé = -10% si ≥ 2 colis).
-    let total = 0; list.forEach(function (c) { total += Number(c.frais_envoi || 0); });
+    // Frais par colis : valeur stockée, sinon recalcul (poids + dimensions).
+    const fraisColis = function (c) {
+      if (Number(c.frais_envoi || 0) > 0) return Number(c.frais_envoi);
+      const kg = Number(c.poids || 0);
+      const Lc = Number(c.longueur || 0), Wc = Number(c.largeur || 0), Hc = Number(c.hauteur || 0);
+      if (!kg) return 0;
+      const pf = (Lc && Wc && Hc) ? Math.ceil(Math.max(kg, (Lc * Wc * Hc) / 1000 / 6.26)) : Math.ceil(kg);
+      return pf * 15;
+    };
+    let total = 0; list.forEach(function (c) { total += fraisColis(c); });
     const groupe = list.length >= 2;
     if (groupe) total = Math.round(total * 0.9 * 100) / 100; // remise regroupement 10%
+    // Refus si total nul (colis non mesuré → pas de prix).
+    if (!(total > 0)) return res.json({ ok: false, error: 'prix_indisponible' });
     // Vérifie le solde wallet.
     if (Number(cli.wallet_balance || 0) < total) {
       return res.json({ ok: false, error: 'solde_insuffisant', total: total, solde: Number(cli.wallet_balance || 0) });
