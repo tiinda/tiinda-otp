@@ -524,6 +524,41 @@ app.get('/colis', requireAuth, async (req, res) => {
   }
 });
 
+// Demande d'expédition (individuelle ou regroupée) — débite le wallet et notifie l'équipe.
+app.post('/colis/expedier', requireAuth, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const phone = req.clientPhone;
+    const { data: cli } = await db.from('clients').select('id, prenom, email, wallet_balance').eq('phone', phone).limit(1).maybeSingle();
+    if (!cli) return res.json({ ok: false, error: 'client_not_found' });
+    const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+    if (!ids.length) return res.json({ ok: false, error: 'aucun_colis' });
+    // Récupère les colis du client, à l'état "reçu", avec un prix.
+    const { data: colis } = await db.from('colis').select('*').eq('client_id', cli.id).in('id', ids);
+    const list = (colis || []).filter(function (c) { return c.statut === 'recu'; });
+    if (!list.length) return res.json({ ok: false, error: 'aucun_colis_eligible' });
+    // Total = somme des frais (regroupé = -10% si ≥ 2 colis).
+    let total = 0; list.forEach(function (c) { total += Number(c.frais_envoi || 0); });
+    const groupe = list.length >= 2;
+    if (groupe) total = Math.round(total * 0.9 * 100) / 100; // remise regroupement 10%
+    // Vérifie le solde wallet.
+    if (Number(cli.wallet_balance || 0) < total) {
+      return res.json({ ok: false, error: 'solde_insuffisant', total: total, solde: Number(cli.wallet_balance || 0) });
+    }
+    // Débite le wallet + journalise + marque les colis "à expédier".
+    await db.from('clients').update({ wallet_balance: Number(cli.wallet_balance) - total }).eq('id', cli.id);
+    await db.from('recharges').insert({ client_id: cli.id, montant: -total, moyen: 'expedition', statut: 'valide' });
+    await db.from('colis').update({ statut: 'a_expedier' }).in('id', list.map(function (c) { return c.id; }));
+    // Facture auto pour l'expédition.
+    const ref = list.map(function (c) { return c.tracking_interne; }).join(', ');
+    emitInvoice(cli.id, (groupe ? 'Expédition groupée (' + list.length + ' colis) vers le Congo' : 'Expédition ' + ref + ' vers le Congo'), total, ref).catch(function(){});
+    res.json({ ok: true, total: total, groupe: groupe, count: list.length });
+  } catch (err) {
+    console.error('expedier error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 /* ── 9) Suivi Track123 ─────────────────────────────────────────────────────
    • track123Import : enregistre un n° de suivi pour que Track123 le surveille.
    • track123Query  : récupère le statut + l'historique d'un n° de suivi.
