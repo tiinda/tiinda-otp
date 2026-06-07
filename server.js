@@ -748,6 +748,35 @@ app.get('/exists', async (req, res) => {
   }
 });
 
+/* ── Assistant Tiinda (Claude / Anthropic) — clé secrète côté serveur ───────
+   Répond aux questions clients sur le service. Renvoie aussi escalate=true
+   quand il vaut mieux passer à un conseiller humain (WhatsApp). */
+const TIINDA_SYSTEM = "Tu es l'assistant virtuel de Tiinda, un service qui donne aux clients une adresse en France pour recevoir leurs achats en ligne (Amazon, Shein, Zara...), puis expédie les colis au Congo-Brazzaville et en RDC. Réponds en français, ton chaleureux et concis. Infos clés : tarif expédition vers le Congo = 15 EUR/kg (poids facturé = le plus élevé entre poids réel et poids volumétrique, 1 kg = 6,26 L). Le client déclare son colis avec le numéro de suivi du transporteur, reçoit un numéro de suivi Tiinda (TND...). Étapes : Reçu en France -> Expédié vers Congo -> Arrivé au Congo -> Disponible au retrait -> Retiré. Le client recharge son solde Tiinda (carte, PayPal ou code de recharge) pour payer les expéditions. Regroupement de plusieurs colis = -10%. Points relais selon la ville. Ne JAMAIS inventer d'infos (numéros de commande, soldes, statuts précis). Si la question concerne un litige, un remboursement, un problème de paiement, un colis perdu, ou que tu n'es pas sûr, invite poliment le client à contacter un conseiller humain.";
+app.post('/chat', async (req, res) => {
+  try {
+    const key = process.env.ANTHROPIC_API_KEY;
+    if (!key) return res.json({ ok: false, error: 'no_key' });
+    if (!rateLimit('chat:' + clientIp(req), 30, 300000)) return res.json({ ok: false, error: 'too_many_requests' });
+    const msgs = Array.isArray(req.body.messages) ? req.body.messages.slice(-12) : [];
+    const clean = msgs.filter(function (m) { return m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string'; })
+      .map(function (m) { return { role: m.role, content: String(m.content).slice(0, 2000) }; });
+    if (!clean.length) return res.json({ ok: false, error: 'empty' });
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-3-5-haiku-latest', max_tokens: 500, system: TIINDA_SYSTEM, messages: clean }),
+    });
+    const data = await r.json();
+    if (!r.ok) { console.error('chat error:', r.status, JSON.stringify(data).slice(0, 300)); return res.json({ ok: false, error: 'ia_error' }); }
+    const reply = (data.content && data.content[0] && data.content[0].text) ? data.content[0].text : '';
+    const escalate = /conseiller|humain|whatsapp|litige|rembours|perdu|r\u00e9clamation/i.test(reply);
+    res.json({ ok: true, reply: reply, escalate: escalate });
+  } catch (err) {
+    console.error('chat exception:', err.message);
+    res.json({ ok: false, error: 'server_error' });
+  }
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true, db: !!db, track123: !!TRACK123_API_KEY }));
 
 /* ── 10) PANNEAU ADMIN (équipe Tiinda) ─────────────────────────────────────
