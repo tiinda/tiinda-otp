@@ -1332,7 +1332,7 @@ app.post('/admin/points-relais/save', requireAdmin, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
     const b = req.body || {};
-    const row = { nom: b.nom || null, adresse: b.adresse || null, ville: b.ville || null, horaires: b.horaires || null, actif: b.actif !== false };
+    const row = { nom: b.nom || null, adresse: b.adresse || null, ville: b.ville || null, telephone: b.telephone || null, horaires: b.horaires || null, actif: b.actif !== false };
     let data, error;
     if (b.id) { ({ data, error } = await db.from('points_relais').update(row).eq('id', b.id).select().single()); }
     else { ({ data, error } = await db.from('points_relais').insert(row).select().single()); }
