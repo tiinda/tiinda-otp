@@ -759,17 +759,28 @@ app.post('/admin/measure', requireScan, async (req, res) => {
       .or('tracking_interne.eq.' + code + ',tracking_externe.eq.' + code).limit(1).maybeSingle();
     if (!colis) return res.json({ ok: false, error: 'colis_introuvable' });
     const num = function (x) { return (x === '' || x == null) ? null : Number(x); };
+    const L = num(b.longueur), W = num(b.largeur), H = num(b.hauteur), kg = num(b.poids);
+    // ── Calcul du prix d'expédition Congo (même formule que la calculette) ──
+    // 15 €/kg · règle volumétrique 1 kg = 6,26 L · poids facturé = max(réel, vol.) arrondi sup.
+    var frais = null;
+    if (L && W && H && kg) {
+      const volumeL = (L * W * H) / 1000;            // cm³ → litres
+      const poidsVol = volumeL / 6.26;               // poids volumétrique
+      const poidsFact = Math.ceil(Math.max(kg, poidsVol));
+      frais = poidsFact * 15;                         // € (15 €/kg)
+    }
     const patch = {
       type_colis: b.type_colis || null,
-      longueur: num(b.longueur), largeur: num(b.largeur), hauteur: num(b.hauteur),
-      poids: num(b.poids), statut: 'recu', received_at: new Date().toISOString(),
+      longueur: L, largeur: W, hauteur: H, poids: kg,
+      statut: 'recu', received_at: new Date().toISOString(),
     };
+    if (frais != null) patch.frais_envoi = frais;
     if (b.description) patch.description = b.description;
     const { data, error } = await db.from('colis').update(patch).eq('id', colis.id).select().single();
     if (error) { console.error('measure error:', error.message); return res.json({ ok: false, error: 'update_failed' }); }
-    // Notifie le client (colis reçu + mesuré).
+    // Notifie le client (colis reçu + mesuré + prix d'expédition).
     if (colis.statut !== 'recu') notifyColisStatus(colis.client_id, data).catch(function(){});
-    res.json({ ok: true, colis: data });
+    res.json({ ok: true, colis: data, frais_envoi: frais });
   } catch (err) {
     console.error('measure error:', err.message);
     res.status(500).json({ ok: false, error: 'server_error' });
