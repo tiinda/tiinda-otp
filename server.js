@@ -1408,6 +1408,36 @@ app.post('/admin/points-relais/delete', requireAdmin, async (req, res) => {
   } catch (e) { res.status(500).json({ ok: false }); }
 });
 
+// (ADMIN) Supervision du parrainage : qui a parrainé qui + récompenses versées.
+app.get('/admin/referrals', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data: clients } = await db.from('clients').select('id, tiinda_id, prenom, nom, phone, parrain_id, created_at');
+    const { data: recs } = await db.from('recharges').select('client_id, montant').eq('moyen', 'parrainage');
+    const cl = clients || [];
+    const byId = {}; cl.forEach(function (c) { byId[c.id] = c; });
+    const gains = {}; (recs || []).forEach(function (r) { gains[r.client_id] = (gains[r.client_id] || 0) + Number(r.montant || 0); });
+    // Compte les filleuls par parrain.
+    const filleulsCount = {};
+    cl.forEach(function (c) { if (c.parrain_id) filleulsCount[c.parrain_id] = (filleulsCount[c.parrain_id] || 0) + 1; });
+    // Parrains (clients ayant au moins 1 filleul) + liste des filleuls.
+    const parrains = cl.filter(function (c) { return filleulsCount[c.id]; }).map(function (p) {
+      const fil = cl.filter(function (c) { return c.parrain_id === p.id; }).map(function (c) {
+        return { nom: ((c.prenom || '') + ' ' + (c.nom || '')).trim(), tiinda_id: c.tiinda_id, date: c.created_at };
+      });
+      return {
+        nom: ((p.prenom || '') + ' ' + (p.nom || '')).trim(), tiinda_id: p.tiinda_id, phone: p.phone,
+        filleuls: fil.length, gains: Number(gains[p.id] || 0), liste: fil,
+      };
+    }).sort(function (a, b) { return b.filleuls - a.filleuls; });
+    const totalGains = Object.keys(gains).reduce(function (s, k) { return s + gains[k]; }, 0);
+    res.json({ ok: true, parrains: parrains, totalParrains: parrains.length, totalFilleuls: cl.filter(function (c) { return c.parrain_id; }).length, totalGains: totalGains });
+  } catch (err) {
+    console.error('admin referrals error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 // (ADMIN) Liste complète des clients : solde, formule, présence, CA, dernier achat.
 app.get('/admin/clients', requireAdmin, async (req, res) => {
   try {
