@@ -452,6 +452,7 @@ app.get('/client', requireAuth, async (req, res) => {
       offre: data.offre, wallet_balance: data.wallet_balance,
       naissance: data.naissance, genre: data.genre,
       commune: data.commune, rue: data.rue, repere: data.repere,
+      created_at: data.created_at, abonnement_fin: data.abonnement_fin,
     }});
   } catch (err) {
     console.error('client error:', err.message);
