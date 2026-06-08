@@ -566,6 +566,34 @@ app.get('/colis', requireAuth, async (req, res) => {
   }
 });
 
+// Changement de forfait payé avec le solde Tiinda (1 mois débité immédiatement).
+app.post('/forfait/change-wallet', requireAuth, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const PRIX = { bokolo: 9.99, familia: 19.90, mokili: 49.90 };
+    const NOM = { bokolo: 'BOKOLO', familia: 'FAMILIA', mokili: 'MOKILI PRO' };
+    const key = String(req.body.key || '').toLowerCase();
+    if (!PRIX[key]) return res.json({ ok: false, error: 'forfait_invalide' });
+    const { data: cli } = await db.from('clients').select('id, wallet_balance').eq('phone', req.clientPhone).limit(1).maybeSingle();
+    if (!cli) return res.json({ ok: false, error: 'client_not_found' });
+    const prix = PRIX[key];
+    if (Number(cli.wallet_balance || 0) < prix) {
+      return res.json({ ok: false, error: 'solde_insuffisant', total: prix, solde: Number(cli.wallet_balance || 0) });
+    }
+    const fin = new Date(); fin.setMonth(fin.getMonth() + 1);
+    await db.from('clients').update({
+      wallet_balance: Number(cli.wallet_balance) - prix,
+      offre: NOM[key], abonnement_fin: fin.toISOString(),
+    }).eq('id', cli.id);
+    await db.from('recharges').insert({ client_id: cli.id, montant: -prix, moyen: 'forfait', statut: 'valide' });
+    emitInvoice(cli.id, 'Abonnement ' + NOM[key] + ' (payé via solde Tiinda)', prix, null).catch(function(){});
+    res.json({ ok: true, offre: NOM[key], fin: fin.toISOString(), solde: Number(cli.wallet_balance) - prix });
+  } catch (err) {
+    console.error('forfait change-wallet error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 // Demande d'expédition (individuelle ou regroupée) — débite le wallet et notifie l'équipe.
 app.post('/colis/expedier', requireAuth, async (req, res) => {
   try {
