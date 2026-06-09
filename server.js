@@ -806,6 +806,26 @@ app.post('/chat', async (req, res) => {
   }
 });
 
+// (EMPLOYÉ) Statistiques rapides de l'entrepôt — comptage par statut.
+app.get('/scan/stats', requireScan, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data } = await db.from('colis').select('statut, created_at');
+    const co = data || [];
+    const by = {};
+    const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+    let today = 0;
+    co.forEach(function (c) {
+      by[c.statut || 'declare'] = (by[c.statut || 'declare'] || 0) + 1;
+      if (c.created_at && new Date(c.created_at) >= dayStart) today++;
+    });
+    res.json({ ok: true, total: co.length, today: today, byStatut: by });
+  } catch (err) {
+    console.error('scan stats error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true, db: !!db, track123: !!TRACK123_API_KEY }));
 
 /* ── 10) PANNEAU ADMIN (équipe Tiinda) ─────────────────────────────────────
@@ -892,6 +912,27 @@ async function notifyColisStatus(clientId, colis) {
   }
 }
 
+// (EMPLOYÉ) Recherche d'un colis par numéro → statut + infos (lecture seule).
+app.get('/scan/lookup', requireScan, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const code = String(req.query.q || '').trim().toUpperCase().replace(/[^A-Z0-9\-]/g, '');
+    if (!code) return res.json({ ok: false, error: 'missing' });
+    const { data: c } = await db.from('colis').select('tracking_interne, tracking_externe, statut, description, type_colis, poids, longueur, largeur, hauteur, frais_envoi, received_at, created_at, client_id')
+      .or('tracking_interne.eq.' + code + ',tracking_externe.eq.' + code).limit(1).maybeSingle();
+    if (!c) return res.json({ ok: false, error: 'colis_introuvable' });
+    let client = null;
+    if (c.client_id) {
+      const { data: cli } = await db.from('clients').select('prenom, nom, tiinda_id, phone, ville').eq('id', c.client_id).maybeSingle();
+      if (cli) client = { nom: ((cli.prenom||'')+' '+(cli.nom||'')).trim(), tiinda_id: cli.tiinda_id, phone: cli.phone, ville: cli.ville };
+    }
+    res.json({ ok: true, colis: c, client: client });
+  } catch (err) {
+    console.error('scan lookup error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 // Réception & mesure : enregistre type, dimensions, poids → transmis admin + client.
 app.post('/admin/measure', requireScan, async (req, res) => {
   try {
@@ -932,6 +973,7 @@ app.post('/admin/measure', requireScan, async (req, res) => {
     res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
+
 
 // Scan entrepôt : trouve un colis par son numéro Tiinda (TND…) et met à jour
 // son statut en un seul appel. Notifie le client + stocke signature/photo.
