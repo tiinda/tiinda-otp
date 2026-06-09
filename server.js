@@ -806,6 +806,175 @@ app.post('/chat', async (req, res) => {
   }
 });
 
+// ── WhatsApp entrant (Twilio) : menu de tri + identification par numéro ──────
+// Twilio appelle cette URL à chaque message WhatsApp reçu. On répond en TwiML.
+const waState = new Map(); // état de conversation par numéro (en mémoire)
+function twiml(msg) {
+  const safe = String(msg).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return '<?xml version="1.0" encoding="UTF-8"?><Response><Message>' + safe + '</Message></Response>';
+}
+const WA_MENU =
+  "👋 Bienvenue chez *TIINDA* — vos achats d'Europe livrés au Congo.\n\n" +
+  "Répondez par un chiffre :\n" +
+  "*1* — Je suis déjà client Tiinda\n" +
+  "*2* — Je ne suis pas encore client\n" +
+  "*3* — Parler à un conseiller\n" +
+  "*4* — Suivre un colis";
+
+// Journalise un contact entrant (WhatsApp/SMS/appel) en l'identifiant par numéro.
+async function logIncoming(phone, canal, message) {
+  if (!db || !phone) return;
+  try {
+    const { data: cli } = await db.from('clients').select('id, prenom, nom, tiinda_id, offre').eq('phone', phone).limit(1).maybeSingle();
+    await db.from('messages').insert({
+      phone: phone, canal: canal, message: (message || '').slice(0, 500),
+      client_id: cli ? cli.id : null,
+      tiinda_id: cli ? cli.tiinda_id : null,
+      nom: cli ? ((cli.prenom || '') + ' ' + (cli.nom || '')).trim() : null,
+      offre: cli ? cli.offre : null,
+      is_client: !!cli,
+    });
+  } catch (e) { console.error('logIncoming error:', e.message); }
+}
+
+// ── SMS entrant (Twilio) : identification + log + réponse menu ──────────────
+app.post('/sms/incoming', express.urlencoded({ extended: false }), async (req, res) => {
+  res.set('Content-Type', 'text/xml');
+  const from = String(req.body.From || '').trim();
+  const bodyRaw = String(req.body.Body || '').trim();
+  logIncoming(from, 'sms', bodyRaw).catch(function(){});
+  res.send(twiml('Merci pour votre message. Pour une réponse rapide, contactez-nous sur WhatsApp ou via votre espace tiinda.com. — TIINDA'));
+});
+
+// ── Appel entrant (Twilio Voice) : identifie l'appelant + log + message ─────
+app.post('/voice/incoming', express.urlencoded({ extended: false }), async (req, res) => {
+  res.set('Content-Type', 'text/xml');
+  const from = String(req.body.From || '').trim();
+  let nom = '';
+  if (db) {
+    try { const { data: cli } = await db.from('clients').select('prenom, tiinda_id').eq('phone', from).limit(1).maybeSingle(); if (cli) nom = cli.prenom || ''; } catch (e) {}
+  }
+  logIncoming(from, 'appel', '').catch(function(){});
+  const say = nom ? ('Bonjour ' + nom + ', bienvenue chez Tiinda. Un conseiller va vous répondre.') : 'Bienvenue chez Tiinda. Un conseiller va vous répondre.';
+  res.send('<?xml version="1.0" encoding="UTF-8"?><Response><Say language="fr-FR">' + say.replace(/&/g, 'et') + '</Say></Response>');
+});
+
+// (ADMIN) Messagerie : contacts entrants identifiés (WhatsApp/SMS/appels).
+app.get('/admin/messages', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data } = await db.from('messages').select('*').order('created_at', { ascending: false }).limit(100);
+    res.json({ ok: true, messages: data || [] });
+  } catch (err) {
+    console.error('admin messages error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+app.post('/whatsapp/incoming', express.urlencoded({ extended: false }), async (req, res) => {
+  res.set('Content-Type', 'text/xml');
+  try {
+    const from = String(req.body.From || '').replace('whatsapp:', '').trim();
+    const bodyRaw = String(req.body.Body || '').trim();
+    logIncoming(from, 'whatsapp', bodyRaw).catch(function(){});
+    const body = bodyRaw.toLowerCase();
+    const st = waState.get(from) || { step: 'menu' };
+
+    // Mots-clés pour revenir au menu à tout moment.
+    if (['menu', 'accueil', 'bonjour', 'salut', 'start', 'hi', 'hello'].indexOf(body) >= 0) {
+      waState.set(from, { step: 'menu' });
+      return res.send(twiml(WA_MENU));
+    }
+
+    // 1) Premier contact → on montre le menu.
+    if (st.step === 'menu' && !/^[1-4]$/.test(body)) {
+      waState.set(from, { step: 'menu' });
+      return res.send(twiml(WA_MENU));
+    }
+
+    // 2) Choix du menu.
+    if (st.step === 'menu' && /^[1-4]$/.test(body)) {
+      if (body === '1') {
+        // Client : on tente de l'identifier par son numéro WhatsApp.
+        if (db) {
+          const { data: cli } = await db.from('clients').select('prenom, nom, tiinda_id, offre, wallet_balance').eq('phone', from).limit(1).maybeSingle();
+          if (cli) {
+            waState.set(from, { step: 'chat', tiinda_id: cli.tiinda_id });
+            return res.send(twiml('✅ Ravi de vous revoir, *' + (cli.prenom || 'cher client') + '* !\n'
+              + 'Votre identifiant : *' + cli.tiinda_id + '*\n'
+              + 'Forfait : ' + (cli.offre || '—') + ' · Solde : ' + Number(cli.wallet_balance || 0).toFixed(2) + ' €\n\n'
+              + 'Comment puis-je vous aider ? (suivi de colis, expédition, recharge…)\nTapez *menu* pour revenir au tri.'));
+          }
+        }
+        // Pas reconnu → on demande l'identifiant.
+        waState.set(from, { step: 'await_id' });
+        return res.send(twiml('Pour vous identifier, envoyez votre *identifiant Tiinda* (ex : TIINDA000248).'));
+      }
+      if (body === '2') {
+        waState.set(from, { step: 'chat' });
+        return res.send(twiml('🎉 Bienvenue ! Avec Tiinda, vous obtenez une *adresse en France* pour recevoir vos achats (Amazon, Shein, Zara…), puis nous les livrons au Congo.\n\n'
+          + '👉 Créez votre compte : https://tiinda.com\n\n'
+          + 'Une question ? Écrivez-la, je vous réponds. (Tapez *menu* pour le tri.)'));
+      }
+      if (body === '3') {
+        waState.set(from, { step: 'human' });
+        return res.send(twiml('🧑‍💼 Un conseiller Tiinda va vous répondre dès que possible (horaires 8h–20h, 7j/7).\n\nDécrivez votre demande en attendant.'));
+      }
+      if (body === '4') {
+        waState.set(from, { step: 'await_track' });
+        return res.send(twiml('📦 Envoyez votre *numéro de suivi Tiinda* (ex : TND123456789) pour connaître le statut de votre colis.'));
+      }
+    }
+
+    // 3) Saisie de l'identifiant Tiinda.
+    if (st.step === 'await_id') {
+      const id = bodyRaw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+      if (db && /^TIINDA\d+/.test(id)) {
+        const { data: cli } = await db.from('clients').select('prenom, tiinda_id, offre, wallet_balance').eq('tiinda_id', id).limit(1).maybeSingle();
+        if (cli) {
+          waState.set(from, { step: 'chat', tiinda_id: cli.tiinda_id });
+          return res.send(twiml('✅ Identifié : *' + (cli.prenom || 'client') + '* (' + cli.tiinda_id + ')\n'
+            + 'Forfait : ' + (cli.offre || '—') + ' · Solde : ' + Number(cli.wallet_balance || 0).toFixed(2) + ' €\n\n'
+            + 'Comment puis-je vous aider ?'));
+        }
+      }
+      return res.send(twiml('❌ Identifiant introuvable. Vérifiez le format (TIINDA…) ou tapez *menu*.'));
+    }
+
+    // 4) Suivi d'un colis.
+    if (st.step === 'await_track') {
+      const code = bodyRaw.toUpperCase().replace(/[^A-Z0-9\-]/g, '');
+      if (db && code) {
+        const { data: c } = await db.from('colis').select('tracking_interne, statut, description')
+          .or('tracking_interne.eq.' + code + ',tracking_externe.eq.' + code).limit(1).maybeSingle();
+        if (c) {
+          const L = { declare: 'Déclaré', recu: 'Reçu à notre entrepôt en France', a_expedier: 'Expédition demandée', expedie: 'En route vers le Congo', arrive: 'Arrivé au Congo', disponible: 'Disponible au retrait', livre: 'Retiré' };
+          return res.send(twiml('📦 *' + c.tracking_interne + '*\n' + (c.description ? c.description + '\n' : '') + 'Statut : *' + (L[c.statut] || c.statut) + '*\n\nTapez *menu* pour revenir.'));
+        }
+      }
+      return res.send(twiml('Colis introuvable. Vérifiez le numéro (TND…) ou tapez *menu*.'));
+    }
+
+    // 5) Sinon → assistant IA (Claude), avec contexte client si connu.
+    const key = process.env.ANTHROPIC_API_KEY;
+    if (key && rateLimit('wa:' + from, 20, 300000)) {
+      const ctx = st.tiinda_id ? ('Le client est identifié, identifiant Tiinda ' + st.tiinda_id + '. ') : '';
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 400, system: ctx + TIINDA_SYSTEM, messages: [{ role: 'user', content: bodyRaw.slice(0, 1000) }] }),
+      });
+      const data = await r.json();
+      const reply = (r.ok && data.content && data.content[0] && data.content[0].text) ? data.content[0].text : 'Désolé, je n\'ai pas compris. Tapez *menu* pour revenir au tri.';
+      return res.send(twiml(reply));
+    }
+    return res.send(twiml('Tapez *menu* pour afficher les options.'));
+  } catch (err) {
+    console.error('whatsapp incoming error:', err.message);
+    return res.send(twiml('Une erreur est survenue. Tapez *menu* pour réessayer.'));
+  }
+});
+
 // (EMPLOYÉ) Statistiques rapides de l'entrepôt — comptage par statut.
 app.get('/scan/stats', requireScan, async (req, res) => {
   try {
