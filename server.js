@@ -957,7 +957,7 @@ app.post('/whatsapp/incoming', express.urlencoded({ extended: false }), async (r
 
     // 5) Sinon → assistant IA (Claude), avec contexte client si connu.
     const key = process.env.ANTHROPIC_API_KEY;
-    if (key && rateLimit('wa:' + from, 20, 300000)) {
+    if (key && rateLimit('wa:' + from, 60, 300000)) {
       const ctx = st.tiinda_id ? ('Le client est identifié, identifiant Tiinda ' + st.tiinda_id + '. ') : '';
       const r = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
