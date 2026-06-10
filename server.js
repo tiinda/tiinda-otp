@@ -221,6 +221,23 @@ function toE164(phone) {
   return '+' + digits;
 }
 
+/* Recherche d'un client par téléphone, tolérante au format (espaces, et au
+   « 0 » après l'indicatif : +242069009078 ↔ +24269009078). */
+async function findClientByPhone(select, phone) {
+  if (!db || !phone) return null;
+  const raw = String(phone).replace(/\s/g, '');
+  const cands = new Set([raw]);
+  // Variante : enlever un 0 juste après l'indicatif (+242 0X… → +242 X…)
+  var m = /^\+(\d{1,4})0(\d+)$/.exec(raw);
+  if (m) cands.add('+' + m[1] + m[2]);
+  // Variante : ajouter un 0 juste après l'indicatif (+242 X… → +242 0X…)
+  var m2 = /^\+(\d{1,4})(\d+)$/.exec(raw);
+  if (m2) cands.add('+' + m2[1] + '0' + m2[2]);
+  const list = Array.from(cands);
+  const { data } = await db.from('clients').select(select).in('phone', list).limit(1);
+  return (data && data[0]) ? data[0] : null;
+}
+
 /* ── 3) Génère le PROCHAIN identifiant TIINDA (ex : TIINDA000248) ──────────
    On lit le dernier identifiant existant, on prend son numéro et on l'incrémente.
    La numérotation démarre à 248 (pour continuer après la maquette). */
@@ -897,7 +914,7 @@ app.post('/whatsapp/incoming', express.urlencoded({ extended: false }), async (r
       if (body === '1') {
         // Client : on tente de l'identifier par son numéro WhatsApp.
         if (db) {
-          const { data: cli } = await db.from('clients').select('prenom, nom, tiinda_id, offre, wallet_balance').eq('phone', from).limit(1).maybeSingle();
+          const cli = await findClientByPhone('prenom, nom, tiinda_id, offre, wallet_balance', from);
           if (cli) {
             waState.set(from, { step: 'chat', tiinda_id: cli.tiinda_id });
             return res.send(twiml('✅ Ravi de vous revoir, *' + (cli.prenom || 'cher client') + '* !\n'
