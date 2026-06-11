@@ -221,21 +221,39 @@ function toE164(phone) {
   return '+' + digits;
 }
 
-/* Recherche d'un client par téléphone, tolérante au format (espaces, et au
-   « 0 » après l'indicatif : +242069009078 ↔ +24269009078). */
+/* Recherche d'un client par téléphone, très tolérante au format :
+   espaces, et « 0 » présent ou non après l'indicatif
+   (+242069009078 ↔ +24269009078, +330628018900 ↔ +33628018900).
+   Repli par suffixe (8 derniers chiffres) si aucune variante exacte. */
 async function findClientByPhone(select, phone) {
   if (!db || !phone) return null;
   const raw = String(phone).replace(/\s/g, '');
   const cands = new Set([raw]);
-  // Variante : enlever un 0 juste après l'indicatif (+242 0X… → +242 X…)
-  var m = /^\+(\d{1,4})0(\d+)$/.exec(raw);
-  if (m) cands.add('+' + m[1] + m[2]);
-  // Variante : ajouter un 0 juste après l'indicatif (+242 X… → +242 0X…)
-  var m2 = /^\+(\d{1,4})(\d+)$/.exec(raw);
-  if (m2) cands.add('+' + m2[1] + '0' + m2[2]);
+  // Indicatifs connus de Tiinda (du plus long au plus court pour la priorité).
+  const codes = ['243', '242', '33', '32', '1'];
+  const digits = raw.replace(/[^\d]/g, '');
+  codes.forEach(function (cc) {
+    if (digits.indexOf(cc) === 0) {
+      const rest = digits.slice(cc.length);
+      const noZero = rest.replace(/^0+/, '');
+      cands.add('+' + cc + rest);
+      cands.add('+' + cc + noZero);       // sans 0 après l'indicatif
+      cands.add('+' + cc + '0' + noZero); // avec 0 après l'indicatif
+    }
+  });
   const list = Array.from(cands);
-  const { data } = await db.from('clients').select(select).in('phone', list).limit(1);
-  return (data && data[0]) ? data[0] : null;
+  let { data } = await db.from('clients').select(select).in('phone', list).limit(1);
+  if (data && data[0]) return data[0];
+  // Repli : compare les 8 derniers chiffres (ignore indicatif + 0).
+  const suffix = digits.slice(-8);
+  if (suffix.length === 8) {
+    const r = await db.from('clients').select(select + ', phone').ilike('phone', '%' + suffix);
+    if (r.data && r.data.length) {
+      const exact = r.data.find(function (c) { return String(c.phone || '').replace(/[^\d]/g, '').slice(-8) === suffix; });
+      if (exact) return exact;
+    }
+  }
+  return null;
 }
 
 /* ── 3) Génère le PROCHAIN identifiant TIINDA (ex : TIINDA000248) ──────────
