@@ -1247,26 +1247,36 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
     const { data: clients } = await db.from('clients').select('offre, ville, created_at, wallet_balance, last_seen');
-    const { data: colis } = await db.from('colis').select('statut, valeur, poids, frais_envoi, created_at');
+    const { data: colis } = await db.from('colis').select('statut, valeur, poids, frais_envoi, created_at, received_at');
     const cl = clients || [], co = colis || [];
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
     const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const monthDay = now.getDate();
+    const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
     const onlineCut = new Date(now.getTime() - 5 * 60000); // en ligne = vu il y a < 5 min
     const norm = function (s) { s = (s || '').toLowerCase(); return s.indexOf('mokili') >= 0 ? 'mokili' : s.indexOf('familia') >= 0 ? 'familia' : 'bokolo'; };
     const byOffre = { bokolo: 0, familia: 0, mokili: 0 };
     const byOffreToday = { bokolo: 0, familia: 0, mokili: 0 };
     const byVille = {};
-    let clientsThisMonth = 0, clientsToday = 0, onlineNow = 0;
+    let clientsThisMonth = 0, clientsToday = 0, onlineNow = 0, clientsPrevMonth = 0;
+    const prevMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
     cl.forEach(function (c) {
       var o = norm(c.offre); byOffre[o]++;
       const v = (c.ville || 'Inconnue'); byVille[v] = (byVille[v] || 0) + 1;
-      if (c.created_at && new Date(c.created_at) >= monthStart) clientsThisMonth++;
-      if (c.created_at && new Date(c.created_at) >= dayStart) { clientsToday++; byOffreToday[o]++; }
+      const dt = c.created_at ? new Date(c.created_at) : null;
+      if (dt && dt >= monthStart) clientsThisMonth++;
+      if (dt && dt >= prevMonthStart && dt < monthStart) clientsPrevMonth++;
+      if (dt && dt >= dayStart) { clientsToday++; byOffreToday[o]++; }
       if (c.last_seen && new Date(c.last_seen) >= onlineCut) onlineNow++;
     });
     const byStatut = {};
     let valeurTotale = 0, poidsTotal = 0, fraisEnvoiTotal = 0, colisThisMonth = 0, colisToday = 0, fraisEnvoiToday = 0;
+    // CA du jour (abonnements créés aujourd'hui + frais d'envoi du jour)
+    const PRICES = { bokolo: 9.99, familia: 19.90, mokili: 49.90 };
+    let caToday = fraisEnvoiToday;
+    // Temps moyen de livraison (received_at → livre) — approximé via received_at des colis livrés
+    let delaiSum = 0, delaiN = 0;
     co.forEach(function (c) {
       byStatut[c.statut || 'declare'] = (byStatut[c.statut || 'declare'] || 0) + 1;
       valeurTotale += Number(c.valeur || 0);
@@ -1274,12 +1284,50 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
       fraisEnvoiTotal += Number(c.frais_envoi || 0);
       if (c.created_at && new Date(c.created_at) >= monthStart) colisThisMonth++;
       if (c.created_at && new Date(c.created_at) >= dayStart) { colisToday++; fraisEnvoiToday += Number(c.frais_envoi || 0); }
+      if (c.statut === 'livre' && c.received_at && c.created_at) {
+        const d = (new Date(c.received_at) - new Date(c.created_at)) / 86400000;
+        if (d >= 0 && d < 120) { delaiSum += d; delaiN++; }
+      }
     });
+    caToday = fraisEnvoiToday + clientsToday >= 0 ? fraisEnvoiToday
+      + byOffreToday.bokolo * PRICES.bokolo + byOffreToday.familia * PRICES.familia + byOffreToday.mokili * PRICES.mokili : 0;
+    const mrr = byOffre.bokolo * PRICES.bokolo + byOffre.familia * PRICES.familia + byOffre.mokili * PRICES.mokili;
+    const revParOffre = {
+      bokolo: byOffre.bokolo * PRICES.bokolo,
+      familia: byOffre.familia * PRICES.familia,
+      mokili: byOffre.mokili * PRICES.mokili
+    };
+    // Conversion visiteurs → abonnés (si un compteur de visites existe, sinon null)
+    const croissance = clientsPrevMonth > 0 ? Math.round((clientsThisMonth - clientsPrevMonth) / clientsPrevMonth * 100) : null;
+    // Projection fin de mois (CA frais d'envoi du mois extrapolé)
+    let fraisMois = 0; co.forEach(function (c) { if (c.created_at && new Date(c.created_at) >= monthStart) fraisMois += Number(c.frais_envoi || 0); });
+    const projFinMois = monthDay > 0 ? Math.round((mrr + fraisMois) / monthDay * daysInMonth) : mrr;
+    const delaiMoyen = delaiN ? Math.round(delaiSum / delaiN * 10) / 10 : null;
+    // Vues par période : semaine / mois / trimestre / année (nouveaux clients, colis, frais encaissés)
+    const startOfWeek = new Date(now); const dow = (now.getDay() + 6) % 7; startOfWeek.setDate(now.getDate() - dow); startOfWeek.setHours(0,0,0,0);
+    const qStart = new Date(now.getFullYear(), Math.floor(now.getMonth()/3)*3, 1);
+    const yStart = new Date(now.getFullYear(), 0, 1);
+    function periodAgg(since) {
+      let nc = 0, np = 0, frais = 0; const off = { bokolo:0, familia:0, mokili:0 };
+      cl.forEach(function (c) { if (c.created_at && new Date(c.created_at) >= since) { nc++; off[norm(c.offre)]++; } });
+      co.forEach(function (c) { if (c.created_at && new Date(c.created_at) >= since) { np++; frais += Number(c.frais_envoi || 0); } });
+      const abo = off.bokolo*PRICES.bokolo + off.familia*PRICES.familia + off.mokili*PRICES.mokili;
+      return { clients: nc, colis: np, frais: Math.round(frais*100)/100, ca: Math.round((abo+frais)*100)/100 };
+    }
+    const periods = {
+      semaine: periodAgg(startOfWeek),
+      mois: periodAgg(monthStart),
+      trimestre: periodAgg(qStart),
+      annee: periodAgg(yStart)
+    };
     res.json({ ok: true, stats: {
       clientsTotal: cl.length, clientsThisMonth: clientsThisMonth, clientsToday: clientsToday, onlineNow: onlineNow,
+      clientsPrevMonth: clientsPrevMonth, croissance: croissance,
       colisTotal: co.length, colisThisMonth: colisThisMonth, colisToday: colisToday,
       byOffre: byOffre, byOffreToday: byOffreToday, byVille: byVille, byStatut: byStatut,
       valeurTotale: valeurTotale, poidsTotal: poidsTotal, fraisEnvoiTotal: fraisEnvoiTotal, fraisEnvoiToday: fraisEnvoiToday,
+      caToday: caToday, mrr: mrr, revParOffre: revParOffre, projFinMois: projFinMois, delaiMoyen: delaiMoyen,
+      periods: periods,
     }});
   } catch (err) {
     console.error('admin stats error:', err.message);
