@@ -1032,6 +1032,20 @@ app.get('/scan/stats', requireScan, async (req, res) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true, db: !!db, track123: !!TRACK123_API_KEY }));
 
+/* ── Compteur de visites (visiteurs journaliers) ───────────────────────────
+   Appelé par le site à chaque visite. Incrémente le compteur du jour dans la
+   table `visites` (jour unique). Sans auth (public), tolérant aux erreurs. */
+app.post('/visite', async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: true });
+    const jour = new Date().toISOString().slice(0, 10);
+    const { data: row } = await db.from('visites').select('count').eq('jour', jour).maybeSingle();
+    if (row) await db.from('visites').update({ count: Number(row.count || 0) + 1 }).eq('jour', jour);
+    else await db.from('visites').insert({ jour: jour, count: 1 });
+    res.json({ ok: true });
+  } catch (e) { res.json({ ok: true }); }
+});
+
 /* ── 10) PANNEAU ADMIN (équipe Tiinda) ─────────────────────────────────────
    Protégé par ADMIN_TOKEN — transmis UNIQUEMENT via le header x-admin-token
    (plus jamais dans l'URL, pour ne pas fuiter dans les logs/historique). */
@@ -1250,6 +1264,13 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
     const { data: colis } = await db.from('colis').select('statut, valeur, poids, frais_envoi, created_at, received_at');
     const { data: recharges } = await db.from('recharges').select('montant, moyen, created_at');
     const rch = recharges || [];
+    var visToday = 0, vis7 = 0;
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      const d7 = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
+      const { data: vrows } = await db.from('visites').select('jour, count').gte('jour', d7);
+      (vrows || []).forEach(function (v) { vis7 += Number(v.count || 0); if (v.jour === today) visToday = Number(v.count || 0); });
+    } catch (e) {}
     const cl = clients || [], co = colis || [];
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -1338,6 +1359,7 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
       caToday: caToday + codeVentesToday, mrr: mrr, revParOffre: revParOffre, projFinMois: projFinMois, delaiMoyen: delaiMoyen,
       codeVentesToday: codeVentesToday, codeVentesMois: codeVentesMois,
       soldeTotal: Math.round(soldeTotal * 100) / 100,
+      visitorsToday: visToday, visitors7: vis7,
       periods: periods,
     }});
   } catch (err) {
