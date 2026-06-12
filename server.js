@@ -1248,6 +1248,8 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
     if (!db) return res.json({ ok: false, error: 'no_db' });
     const { data: clients } = await db.from('clients').select('offre, ville, created_at, wallet_balance, last_seen');
     const { data: colis } = await db.from('colis').select('statut, valeur, poids, frais_envoi, created_at, received_at');
+    const { data: recharges } = await db.from('recharges').select('montant, moyen, created_at');
+    const rch = recharges || [];
     const cl = clients || [], co = colis || [];
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -1259,10 +1261,11 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
     const byOffre = { bokolo: 0, familia: 0, mokili: 0 };
     const byOffreToday = { bokolo: 0, familia: 0, mokili: 0 };
     const byVille = {};
-    let clientsThisMonth = 0, clientsToday = 0, onlineNow = 0, clientsPrevMonth = 0;
+    let clientsThisMonth = 0, clientsToday = 0, onlineNow = 0, clientsPrevMonth = 0, soldeTotal = 0;
     const prevMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
     cl.forEach(function (c) {
       var o = norm(c.offre); byOffre[o]++;
+      soldeTotal += Number(c.wallet_balance || 0);
       const v = (c.ville || 'Inconnue'); byVille[v] = (byVille[v] || 0) + 1;
       const dt = c.created_at ? new Date(c.created_at) : null;
       if (dt && dt >= monthStart) clientsThisMonth++;
@@ -1302,17 +1305,23 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
     // Projection fin de mois (CA frais d'envoi du mois extrapolé)
     let fraisMois = 0; co.forEach(function (c) { if (c.created_at && new Date(c.created_at) >= monthStart) fraisMois += Number(c.frais_envoi || 0); });
     const projFinMois = monthDay > 0 ? Math.round((mrr + fraisMois) / monthDay * daysInMonth) : mrr;
+    // Ventes par code Tiinda (recharges validées) — comptées comme du CA à leur date.
+    let codeVentesToday = 0, codeVentesMois = 0;
+    function codeAgg(since) { let t = 0; rch.forEach(function (r) { if (r.moyen === 'code' && r.created_at && new Date(r.created_at) >= since && Number(r.montant) > 0) t += Number(r.montant); }); return Math.round(t * 100) / 100; }
+    codeVentesToday = codeAgg(dayStart);
+    codeVentesMois = codeAgg(monthStart);
     const delaiMoyen = delaiN ? Math.round(delaiSum / delaiN * 10) / 10 : null;
     // Vues par période : semaine / mois / trimestre / année (nouveaux clients, colis, frais encaissés)
     const startOfWeek = new Date(now); const dow = (now.getDay() + 6) % 7; startOfWeek.setDate(now.getDate() - dow); startOfWeek.setHours(0,0,0,0);
     const qStart = new Date(now.getFullYear(), Math.floor(now.getMonth()/3)*3, 1);
     const yStart = new Date(now.getFullYear(), 0, 1);
     function periodAgg(since) {
-      let nc = 0, np = 0, frais = 0; const off = { bokolo:0, familia:0, mokili:0 };
+      let nc = 0, np = 0, frais = 0, codes = 0; const off = { bokolo:0, familia:0, mokili:0 };
       cl.forEach(function (c) { if (c.created_at && new Date(c.created_at) >= since) { nc++; off[norm(c.offre)]++; } });
       co.forEach(function (c) { if (c.created_at && new Date(c.created_at) >= since) { np++; frais += Number(c.frais_envoi || 0); } });
+      rch.forEach(function (r) { if (r.moyen === 'code' && r.created_at && new Date(r.created_at) >= since && Number(r.montant) > 0) codes += Number(r.montant); });
       const abo = off.bokolo*PRICES.bokolo + off.familia*PRICES.familia + off.mokili*PRICES.mokili;
-      return { clients: nc, colis: np, frais: Math.round(frais*100)/100, ca: Math.round((abo+frais)*100)/100 };
+      return { clients: nc, colis: np, frais: Math.round(frais*100)/100, codes: Math.round(codes*100)/100, ca: Math.round((abo+frais+codes)*100)/100 };
     }
     const periods = {
       semaine: periodAgg(startOfWeek),
@@ -1326,7 +1335,9 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
       colisTotal: co.length, colisThisMonth: colisThisMonth, colisToday: colisToday,
       byOffre: byOffre, byOffreToday: byOffreToday, byVille: byVille, byStatut: byStatut,
       valeurTotale: valeurTotale, poidsTotal: poidsTotal, fraisEnvoiTotal: fraisEnvoiTotal, fraisEnvoiToday: fraisEnvoiToday,
-      caToday: caToday, mrr: mrr, revParOffre: revParOffre, projFinMois: projFinMois, delaiMoyen: delaiMoyen,
+      caToday: caToday + codeVentesToday, mrr: mrr, revParOffre: revParOffre, projFinMois: projFinMois, delaiMoyen: delaiMoyen,
+      codeVentesToday: codeVentesToday, codeVentesMois: codeVentesMois,
+      soldeTotal: Math.round(soldeTotal * 100) / 100,
       periods: periods,
     }});
   } catch (err) {
