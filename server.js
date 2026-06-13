@@ -1256,6 +1256,40 @@ app.post('/admin/colis/update', requireAdmin, async (req, res) => {
   }
 });
 
+// Rapports & analyses : CA par source, acquisition, top marchands, recharges.
+app.get('/admin/reports', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data: colis } = await db.from('colis').select('site_marchand, poids, valeur, frais_envoi, created_at');
+    const { data: rech } = await db.from('recharges').select('montant, moyen');
+    const { data: cl } = await db.from('clients').select('offre, acq_source, created_at');
+    const co = colis || [], rc = rech || [], cls = cl || [];
+    const PRICES = { bokolo: 9.99, familia: 19.90, mokili: 49.90 };
+    const norm = function (s) { s = (s || '').toLowerCase(); return s.indexOf('mokili') >= 0 ? 'mokili' : s.indexOf('familia') >= 0 ? 'familia' : 'bokolo'; };
+    // CA par source
+    let abos = 0; cls.forEach(function (c) { abos += PRICES[norm(c.offre)]; });
+    let frais = 0; co.forEach(function (c) { frais += Number(c.frais_envoi || 0); });
+    let codes = 0; rc.forEach(function (r) { if (r.moyen === 'code' && Number(r.montant) > 0) codes += Number(r.montant); });
+    // Top marchands
+    const merch = {}; co.forEach(function (c) { const m = (c.site_marchand || 'Autre').trim() || 'Autre'; merch[m] = (merch[m] || 0) + 1; });
+    // Acquisition
+    const acq = {}; cls.forEach(function (c) { const a = c.acq_source || 'non renseigné'; acq[a] = (acq[a] || 0) + 1; });
+    // Recharges par moyen
+    const rechMoyen = {}; rc.forEach(function (r) { if (Number(r.montant) > 0) { const m = r.moyen || 'autre'; rechMoyen[m] = (rechMoyen[m] || 0) + Number(r.montant); } });
+    // Moyennes colis
+    let pSum = 0, pN = 0, vSum = 0, vN = 0; co.forEach(function (c) { if (c.poids) { pSum += Number(c.poids); pN++; } if (c.valeur) { vSum += Number(c.valeur); vN++; } });
+    res.json({ ok: true, reports: {
+      caSource: { abonnements: Math.round(abos*100)/100, frais: Math.round(frais*100)/100, codes: Math.round(codes*100)/100 },
+      topMerchants: merch, acquisition: acq, rechargesMoyen: rechMoyen,
+      poidsMoyen: pN ? Math.round(pSum/pN*100)/100 : 0, valeurMoyenne: vN ? Math.round(vSum/vN*100)/100 : 0,
+      colisCount: co.length,
+    }});
+  } catch (err) {
+    console.error('reports error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 // Indicateurs (KPI) pour le pilotage : abonnés, colis, CA, répartitions.
 app.get('/admin/stats', requireAdmin, async (req, res) => {
   try {
