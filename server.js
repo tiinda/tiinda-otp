@@ -306,14 +306,122 @@ async function getOrCreateClient(phone, info = {}) {
   return created;
 }
 
+/* ── 3 bis) LIMITATION DES ENVOIS DE CODE ─────────────────────────────────
+   Chaque code envoyé est facturé. On refuse donc l'envoi si :
+     1. le numéro a déjà été vérifié une fois
+     2. le numéro appartient déjà à un client
+     3. le dernier code date de moins d'une minute
+     4. trois codes ont déjà été envoyés à ce numéro
+     5. l'indicatif n'est pas desservi par Tiinda
+     6. le plafond global du jour est atteint
+
+   Table à créer dans Supabase (SQL Editor) :
+
+     create table if not exists otp_log (
+       phone    text primary key,
+       envois   integer     not null default 0,
+       dernier  timestamptz not null default now(),
+       verifie  boolean     not null default false,
+       cree_le  timestamptz not null default now()
+     );
+     create index if not exists otp_log_dernier_idx on otp_log (dernier);
+   ───────────────────────────────────────────────────────────────────────── */
+const OTP_DELAI_MS   = 60 * 1000;   // 60 secondes entre deux codes
+const OTP_MAX_NUMERO = 3;           // 3 codes maximum par numéro
+const OTP_MAX_JOUR   = 100;         // plafond global de sécurité sur 24 h
+const OTP_INDICATIFS = ['+243', '+242', '+33', '+32', '+41', '+49', '+39', '+34', '+44'];
+
+function otpIndicatifOk(phone) {
+  if (!/^\+[1-9]\d{7,14}$/.test(phone || '')) return false;
+  return OTP_INDICATIFS.some((i) => String(phone).startsWith(i));
+}
+
+async function otpVolumeDuJour() {
+  if (!db) return 0;
+  const depuis = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const { count } = await db
+    .from('otp_log')
+    .select('phone', { count: 'exact', head: true })
+    .gte('dernier', depuis);
+  return count || 0;
+}
+
+/* Décide si un code peut partir. Renvoie { ok, raison, message, reste }. */
+async function otpAutorise(phone) {
+  if (!otpIndicatifOk(phone)) {
+    return { ok: false, raison: 'indicatif', message: "Ce numéro n'est pas desservi par Tiinda." };
+  }
+  if (!db) return { ok: true };   // sans base, on ne bloque pas le service
+
+  // Déjà client ? Inutile de payer un code, il doit se connecter.
+  const dejaClient = await findClientByPhone('id', phone);
+  if (dejaClient) {
+    return { ok: false, raison: 'client', message: 'Ce numéro est déjà associé à un compte Tiinda. Connectez-vous avec votre email et votre mot de passe.' };
+  }
+
+  const { data } = await db.from('otp_log').select('*').eq('phone', phone).maybeSingle();
+  if (data) {
+    if (data.verifie) {
+      return { ok: false, raison: 'verifie', message: 'Ce numéro a déjà été vérifié. Connectez-vous avec votre email et votre mot de passe.' };
+    }
+    if ((data.envois || 0) >= OTP_MAX_NUMERO) {
+      return { ok: false, raison: 'quota', message: 'Trop de codes demandés pour ce numéro. Écrivez-nous sur WhatsApp.' };
+    }
+    const reste = OTP_DELAI_MS - (Date.now() - new Date(data.dernier).getTime());
+    if (reste > 0) {
+      const s = Math.ceil(reste / 1000);
+      return { ok: false, raison: 'delai', reste: s, message: 'Patientez ' + s + ' secondes avant de redemander un code.' };
+    }
+  }
+
+  if (await otpVolumeDuJour() >= OTP_MAX_JOUR) {
+    return { ok: false, raison: 'plafond', message: 'Service momentanément indisponible. Réessayez plus tard.' };
+  }
+  return { ok: true };
+}
+
+/* À appeler après un envoi Twilio réussi (on ne compte que les vrais envois). */
+async function otpEnregistre(phone) {
+  if (!db) return;
+  try {
+    const { data } = await db.from('otp_log').select('envois').eq('phone', phone).maybeSingle();
+    await db.from('otp_log').upsert({
+      phone,
+      envois: ((data && data.envois) || 0) + 1,
+      dernier: new Date().toISOString(),
+    });
+  } catch (e) { console.error('otp_log envoi:', e.message); }
+}
+
+/* À appeler dès que Twilio confirme le code : ce numéro ne coûtera plus rien. */
+async function otpMarqueVerifie(phone) {
+  if (!db) return;
+  try {
+    await db.from('otp_log').upsert({
+      phone,
+      verifie: true,
+      dernier: new Date().toISOString(),
+    });
+  } catch (e) { console.error('otp_log verifie:', e.message); }
+}
+
 /* ── 4) Route : envoi du code (WhatsApp ou SMS selon OTP_CHANNEL) ────────── */
 app.post('/send', verifyShopifyProxy, async (req, res) => {
   try {
     if (!rateLimit('send:' + clientIp(req), 8, 600000)) return res.status(429).json({ ok: false, error: 'too_many_requests' });
     const phone = toE164(req.body.phone);
     if (!phone || phone.length < 8) return res.status(400).json({ ok: false, error: 'invalid phone' });
+
+    // Garde-fou : aucun code payant n'est envoyé si une règle est enfreinte.
+    const garde = await otpAutorise(phone);
+    if (!garde.ok) {
+      console.log('otp refuse', phone, garde.raison);
+      return res.json({ ok: false, error: garde.raison, message: garde.message, reste: garde.reste });
+    }
+
     await client.verify.v2.services(TWILIO_VERIFY_SERVICE_SID)
       .verifications.create({ to: phone, channel: process.env.OTP_CHANNEL || 'whatsapp' });
+    await otpEnregistre(phone);
     res.json({ ok: true });
   } catch (err) {
     console.error('send error:', err.message);
@@ -333,6 +441,9 @@ app.post('/verify', verifyShopifyProxy, async (req, res) => {
       .verificationChecks.create({ to: phone, code });
     const approved = check.status === 'approved';
     if (!approved) return res.json({ ok: false });
+
+    // Numéro vérifié : plus jamais d'envoi payant sur ce numéro.
+    await otpMarqueVerifie(phone);
 
     // ✅ Code validé → on crée (ou récupère) le client dans Supabase.
     const record = await getOrCreateClient(phone, {
