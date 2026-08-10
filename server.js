@@ -717,23 +717,94 @@ app.post('/forfait/change-wallet', requireAuth, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
     const PRIX = { bokolo: 9.99, familia: 19.90, mokili: 49.90 };
-    const NOM = { bokolo: 'BOKOLO', familia: 'FAMILIA', mokili: 'MOKILI PRO' };
+    const NOM  = { bokolo: 'BOKOLO', familia: 'FAMILIA', mokili: 'MOKILI PRO' };
+    const RANG = { 'BOKOLO': 1, 'FAMILIA': 2, 'MOKILI PRO': 3 };
+    const PRIX_PAR_NOM = { 'BOKOLO': 9.99, 'FAMILIA': 19.90, 'MOKILI PRO': 49.90 };
+
     const key = String(req.body.key || '').toLowerCase();
     if (!PRIX[key]) return res.json({ ok: false, error: 'forfait_invalide' });
-    const { data: cli } = await db.from('clients').select('id, wallet_balance').eq('phone', req.clientPhone).limit(1).maybeSingle();
+
+    const { data: cli } = await db.from('clients')
+      .select('id, wallet_balance, offre, abonnement_fin')
+      .eq('phone', req.clientPhone).limit(1).maybeSingle();
     if (!cli) return res.json({ ok: false, error: 'client_not_found' });
-    const prix = PRIX[key];
-    if (Number(cli.wallet_balance || 0) < prix) {
-      return res.json({ ok: false, error: 'solde_insuffisant', total: prix, solde: Number(cli.wallet_balance || 0) });
+
+    const solde = Number(cli.wallet_balance || 0);
+    const cible = NOM[key];
+    const actuelle = String(cli.offre || '').toUpperCase();
+    const fin = cli.abonnement_fin ? new Date(cli.abonnement_fin) : null;
+    const maintenant = new Date();
+    const actif = fin && fin > maintenant && actuelle && actuelle !== 'DECOUVERTE';
+
+    let prix, nouvelleFin, mode, detail = null;
+
+    if (!actif) {
+      // Aucun forfait en cours : mois plein.
+      prix = PRIX[key];
+      nouvelleFin = new Date(maintenant); nouvelleFin.setMonth(nouvelleFin.getMonth() + 1);
+      mode = 'souscription';
+
+    } else if (actuelle === cible) {
+      return res.json({
+        ok: false, error: 'deja_abonne', offre: actuelle, fin: cli.abonnement_fin,
+        message: 'Vous avez déjà le forfait ' + actuelle + ' jusqu\'au '
+               + fin.toLocaleDateString('fr-FR') + '.'
+      });
+
+    } else if ((RANG[cible] || 0) > (RANG[actuelle] || 0)) {
+      // MONTÉE EN GAMME : effet immédiat, on paie la différence au prorata.
+      const joursRestants = Math.max(0, Math.ceil((fin - maintenant) / 86400000));
+      const diffMensuelle = PRIX_PAR_NOM[cible] - (PRIX_PAR_NOM[actuelle] || 0);
+      prix = Math.round((diffMensuelle * joursRestants / 30) * 100) / 100;
+      if (prix < 0) prix = 0;
+      nouvelleFin = fin;                    // l'échéance ne change pas
+      mode = 'montee_prorata';
+      detail = { jours_restants: joursRestants, difference_mensuelle: diffMensuelle };
+
+    } else {
+      // DESCENTE EN GAMME : pas de remboursement, effet à l'échéance.
+      await db.from('clients').update({ offre_suivante: cible }).eq('id', cli.id);
+      return res.json({
+        ok: true, programme: true, offre_actuelle: actuelle, offre_suivante: cible,
+        fin: cli.abonnement_fin, solde: solde,
+        message: 'Passage à ' + cible + ' programmé pour le '
+               + fin.toLocaleDateString('fr-FR') + '. Aucun prélèvement aujourd\'hui.'
+      });
     }
-    const fin = new Date(); fin.setMonth(fin.getMonth() + 1);
+
+    if (solde < prix) {
+      return res.json({ ok: false, error: 'solde_insuffisant', total: prix, solde: solde });
+    }
+
+    // Référence unique : client + forfait + mois → double clic sans effet.
+    const ref = 'FORFAIT-' + cli.id + '-' + cible + '-' + maintenant.toISOString().slice(0, 7);
+    const { error: errRef } = await db.from('recharges').insert({
+      client_id: cli.id, montant: -prix, moyen: 'forfait', statut: 'valide', reference: ref
+    });
+    if (errRef && errRef.code === '23505') {
+      return res.json({ ok: false, error: 'deja_paye_ce_mois',
+        message: 'Ce changement a déjà été réglé ce mois-ci.' });
+    }
+    if (errRef) { console.error('forfait ref error:', errRef.message);
+      return res.json({ ok: false, error: 'insert_failed' }); }
+
     await db.from('clients').update({
-      wallet_balance: Number(cli.wallet_balance) - prix,
-      offre: NOM[key], abonnement_fin: fin.toISOString(),
+      wallet_balance: solde - prix,
+      offre: cible,
+      abonnement_fin: nouvelleFin.toISOString(),
+      offre_suivante: null
     }).eq('id', cli.id);
-    await db.from('recharges').insert({ client_id: cli.id, montant: -prix, moyen: 'forfait', statut: 'valide' });
-    emitInvoice(cli.id, 'Abonnement ' + NOM[key] + ' (payé via solde Tiinda)', prix, null).catch(function(){});
-    res.json({ ok: true, offre: NOM[key], fin: fin.toISOString(), solde: Number(cli.wallet_balance) - prix });
+
+    const libelle = mode === 'montee_prorata'
+      ? 'Montée en gamme ' + actuelle + ' vers ' + cible + ' (prorata '
+        + detail.jours_restants + ' jours)'
+      : 'Abonnement ' + cible + ' (payé via solde Tiinda)';
+    emitInvoice(cli.id, libelle, prix, null).catch(function(){});
+
+    res.json({
+      ok: true, mode: mode, offre: cible, fin: nouvelleFin.toISOString(),
+      debite: prix, solde: solde - prix, detail: detail
+    });
   } catch (err) {
     console.error('forfait change-wallet error:', err.message);
     res.status(500).json({ ok: false, error: 'server_error' });
@@ -753,6 +824,10 @@ app.post('/colis/expedier', requireAuth, async (req, res) => {
     const { data: colis } = await db.from('colis').select('*').eq('client_id', cli.id).in('id', ids);
     const list = (colis || []).filter(function (c) { return c.statut === 'recu'; });
     if (!list.length) return res.json({ ok: false, error: 'aucun_colis_eligible' });
+    if (list.length !== ids.length) {
+      return res.json({ ok: false, error: 'colis_deja_expedies',
+        message: 'Un ou plusieurs colis ont déjà été expédiés.' });
+    }
     // Frais par colis : valeur stockée, sinon recalcul (poids + dimensions).
     const fraisColis = function (c) {
       if (Number(c.frais_envoi || 0) > 0) return Number(c.frais_envoi);
@@ -773,8 +848,24 @@ app.post('/colis/expedier', requireAuth, async (req, res) => {
     }
     // Débite le wallet + journalise + marque les colis "à expédier".
     await db.from('clients').update({ wallet_balance: Number(cli.wallet_balance) - total }).eq('id', cli.id);
-    await db.from('recharges').insert({ client_id: cli.id, montant: -total, moyen: 'expedition', statut: 'valide' });
-    await db.from('colis').update({ statut: 'a_expedier' }).in('id', list.map(function (c) { return c.id; }));
+    const refExp = 'EXP-' + list.map(function (c) { return c.id; }).sort().join('-');
+    const { error: errExp } = await db.from('recharges').insert({
+      client_id: cli.id, montant: -total, moyen: 'expedition', statut: 'valide', reference: refExp
+    });
+    if (errExp && errExp.code === '23505') {
+      await db.from('clients').update({ wallet_balance: Number(cli.wallet_balance) }).eq('id', cli.id);
+      return res.json({ ok: false, error: 'expedition_deja_payee',
+        message: 'Cette expédition a déjà été réglée.' });
+    }
+    // On ne marque que les colis encore "recu" : verrou contre le double clic.
+    const { data: majColis } = await db.from('colis')
+      .update({ statut: 'a_expedier' })
+      .in('id', list.map(function (c) { return c.id; }))
+      .eq('statut', 'recu')
+      .select('id');
+    if (!majColis || majColis.length !== list.length) {
+      return res.json({ ok: false, error: 'colis_deja_expedies' });
+    }
     // Facture auto pour l'expédition.
     const ref = list.map(function (c) { return c.tracking_interne; }).join(', ');
     emitInvoice(cli.id, (groupe ? 'Expédition groupée (' + list.length + ' colis) vers le Congo' : 'Expédition ' + ref + ' vers le Congo'), total, ref).catch(function(){});
@@ -1786,7 +1877,13 @@ app.post('/wallet/redeem', requireAuth, async (req, res) => {
     if (!rc) return res.json({ ok: false, error: 'code_invalide' });
     if (rc.used) return res.json({ ok: false, error: 'code_deja_utilise' });
     // Marque le code utilisé puis crédite.
-    await db.from('recharge_codes').update({ used: true, used_by: cli.id, used_at: new Date().toISOString() }).eq('id', rc.id);
+    // Marque le code SEULEMENT s'il est encore libre : deux clics simultanés
+    // ne peuvent plus le consommer deux fois.
+    const { data: pris } = await db.from('recharge_codes')
+      .update({ used: true, used_by: cli.id, used_at: new Date().toISOString() })
+      .eq('id', rc.id).eq('used', false)
+      .select('id');
+    if (!pris || !pris.length) return res.json({ ok: false, error: 'code_deja_utilise' });
     const newBal = await creditWallet(cli.id, rc.montant, 'code', code);
     res.json({ ok: true, montant: Number(rc.montant), balance: newBal });
   } catch (err) {
@@ -1943,6 +2040,90 @@ app.get('/admin/clients', requireAdmin, async (req, res) => {
     res.json({ ok: true, clients: rows });
   } catch (err) {
     console.error('admin clients error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+/* ── Rappels d'échéance d'abonnement ───────────────────────────────────────
+   Appelé une fois par jour par le Cron Render. Protégé par CRON_SECRET.
+   ───────────────────────────────────────────────────────────────────────── */
+app.post('/cron/rappels', async (req, res) => {
+  try {
+    const secret = req.get('X-Cron-Secret') || '';
+    if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+      return res.status(403).json({ ok: false, error: 'forbidden' });
+    }
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+
+    const { data: liste, error } = await db.rpc('abonnements_a_rappeler');
+    if (error) { console.error('rappels rpc:', error.message);
+      return res.json({ ok: false, error: 'rpc_failed' }); }
+
+    let envoyes = 0;
+    for (const c of (liste || [])) {
+      const fin = new Date(c.abonnement_fin);
+      const finFr = fin.toLocaleDateString('fr-FR');
+      const manque = Math.round((Number(c.prix_requis) - Number(c.wallet_balance)) * 100) / 100;
+      const ref = 'RAPPEL-' + c.client_id + '-' + c.type_rappel + '-'
+                + fin.toISOString().slice(0, 10);
+
+      // Verrou d'unicité : si déjà envoyé, on passe.
+      const { error: errRef } = await db.from('rappels_envoyes')
+        .insert({ client_id: c.client_id, type: c.type_rappel, reference: ref });
+      if (errRef) continue;
+
+      const titre = c.type_rappel === 'J7'
+        ? 'Votre forfait ' + c.offre + ' se renouvelle le ' + finFr
+        : 'Dernier jour : rechargez pour garder votre forfait ' + c.offre;
+
+      const corps = 'Solde actuel : ' + Number(c.wallet_balance).toFixed(2) + ' EUR. '
+        + 'Il vous manque ' + manque.toFixed(2) + ' EUR pour le renouvellement du '
+        + finFr + '. Sans recharge, votre compte repassera en offre Découverte.';
+
+      if (c.notif_email && c.email && RESEND_API_KEY) {
+        const html = '<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto">'
+          + '<div style="background:#0057FF;color:#fff;padding:18px;border-radius:12px 12px 0 0;text-align:center">'
+          + '<strong style="font-size:18px">TIINDA</strong></div>'
+          + '<div style="border:1px solid #eee;border-top:none;padding:22px;border-radius:0 0 12px 12px">'
+          + '<p>Bonjour ' + (c.prenom || '') + ',</p>'
+          + '<p><strong>' + titre + '</strong></p>'
+          + '<p>' + corps + '</p>'
+          + '<p style="margin:24px 0"><a href="https://tiinda.com/pages/mon-espace" '
+          + 'style="background:#0057FF;color:#fff;padding:12px 22px;border-radius:9px;'
+          + 'text-decoration:none;font-weight:600">Recharger mon compte</a></p>'
+          + '<p style="font-size:12.5px;color:#666">Vos colis et votre adresse restent actifs.</p>'
+          + '</div></div>';
+        try {
+          await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ from: MAIL_FROM || 'Tiinda <onboarding@resend.dev>',
+              to: c.email, subject: 'Tiinda — ' + titre, html })
+          });
+        } catch (e) { console.error('rappel mail:', e.message); }
+      }
+
+      // WhatsApp : nécessite un template dédié approuvé par Meta
+      // (3 variables : prénom, forfait, date). Renseignez TWILIO_WA_ABO_SID.
+      if (c.notif_whatsapp && process.env.TWILIO_WHATSAPP_FROM && process.env.TWILIO_WA_ABO_SID) {
+        try {
+          await client.messages.create({
+            from: 'whatsapp:' + process.env.TWILIO_WHATSAPP_FROM,
+            to: 'whatsapp:' + c.phone,
+            contentSid: process.env.TWILIO_WA_ABO_SID,
+            contentVariables: JSON.stringify({
+              '1': c.prenom || 'cher client', '2': c.offre, '3': finFr
+            }),
+          });
+        } catch (e) { console.error('rappel wa:', e.message); }
+      }
+
+      envoyes++;
+    }
+
+    res.json({ ok: true, candidats: (liste || []).length, envoyes: envoyes });
+  } catch (err) {
+    console.error('cron rappels error:', err.message);
     res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
