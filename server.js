@@ -866,10 +866,21 @@ app.post('/colis/expedier', requireAuth, async (req, res) => {
     if (!majColis || majColis.length !== list.length) {
       return res.json({ ok: false, error: 'colis_deja_expedies' });
     }
+    /* Bon de préparation : l'étape Départ se pilote par ce numéro, pas par
+       le numéro de suivi. Un picking = une demande d'expédition d'un client. */
+    const d = new Date();
+    const jour = String(d.getFullYear()).slice(2) + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+    const { count: dejaCeJour } = await db
+      .from('colis')
+      .select('picking', { count: 'exact', head: true })
+      .like('picking', 'PK-' + jour + '-%');
+    const picking = 'PK-' + jour + '-' + String((dejaCeJour || 0) + 1).padStart(3, '0');
+    await db.from('colis').update({ picking: picking }).in('id', list.map(function (c) { return c.id; }));
+
     // Facture auto pour l'expédition.
     const ref = list.map(function (c) { return c.tracking_interne; }).join(', ');
     emitInvoice(cli.id, (groupe ? 'Expédition groupée (' + list.length + ' colis) vers le Congo' : 'Expédition ' + ref + ' vers le Congo'), total, ref).catch(function(){});
-    res.json({ ok: true, total: total, groupe: groupe, count: list.length });
+    res.json({ ok: true, total: total, groupe: groupe, count: list.length, picking: picking });
   } catch (err) {
     console.error('expedier error:', err.message);
     res.status(500).json({ ok: false, error: 'server_error' });
@@ -1422,6 +1433,80 @@ app.get('/admin/place/next', requireScan, async (req, res) => {
       emplacement: libre,
       detail: `Allée ${libre[0]} · rayonnage ${libre.slice(2, 4)} · ${ETAGE_LIB[et]}`,
       restantes: Math.max(0, total - prises.size),
+    });
+  } catch (e) {
+    res.json({ ok: false, error: 'exception' });
+  }
+});
+
+/* (EMPLOYÉ) Bons de préparation en attente — le poste Départ de Drancy les
+   affiche et imprime automatiquement les nouveaux. */
+app.get('/admin/picking/pending', requireScan, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data: rows } = await db.from('colis')
+      .select('picking, client_id, emplacement')
+      .eq('statut', 'a_expedier')
+      .not('picking', 'is', null);
+    if (!rows || !rows.length) return res.json({ ok: true, pickings: [] });
+
+    const par = new Map();
+    for (const r of rows) {
+      const g = par.get(r.picking) || { picking: r.picking, client_id: r.client_id, colis: 0, places: [] };
+      g.colis++; if (r.emplacement) g.places.push(r.emplacement);
+      par.set(r.picking, g);
+    }
+    const ids = [...new Set(rows.map((r) => r.client_id))];
+    const { data: cls } = await db.from('clients').select('id, prenom, nom, ville').in('id', ids);
+    const nom = new Map((cls || []).map((c) => [c.id, [c.prenom, c.nom].filter(Boolean).join(' ')]));
+
+    res.json({
+      ok: true,
+      pickings: [...par.values()]
+        .sort((a, b) => a.picking.localeCompare(b.picking))
+        .map((g) => ({ picking: g.picking, colis: g.colis, client: nom.get(g.client_id) || '—', places: g.places.sort() })),
+    });
+  } catch (e) {
+    res.json({ ok: false, error: 'exception' });
+  }
+});
+
+/* (EMPLOYÉ) Bon de préparation : liste les colis à aller chercher, avec
+   leur emplacement dans le dépôt. Accepte le n° de picking OU un n° de colis. */
+app.get('/admin/picking', requireScan, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    let num = String(req.query.q || '').trim().toUpperCase();
+    if (!num) return res.json({ ok: false, error: 'params' });
+
+    if (!/^PK-/.test(num)) {
+      const { data: un } = await db.from('colis').select('picking')
+        .or(`tracking_interne.eq.${num},tracking_externe.eq.${num}`).limit(1).maybeSingle();
+      if (!un || !un.picking) return res.json({ ok: false, error: 'pas_de_picking' });
+      num = un.picking;
+    }
+
+    const { data: colis } = await db.from('colis')
+      .select('tracking_interne, description, poids, longueur, largeur, hauteur, type_colis, emplacement, statut, client_id, picking')
+      .eq('picking', num)
+      .order('emplacement', { ascending: true });
+    if (!colis || !colis.length) return res.json({ ok: false, error: 'picking_introuvable' });
+
+    const { data: cl } = await db.from('clients')
+      .select('prenom, nom, tiinda_id, offre, phone, ville, commune, rue, repere')
+      .eq('id', colis[0].client_id).maybeSingle();
+
+    res.json({
+      ok: true,
+      picking: num,
+      statut: colis.every((c) => c.statut !== 'a_expedier') ? 'traite' : 'a_preparer',
+      client: cl || {},
+      colis: colis.map((c, i) => ({
+        code: c.tracking_interne, emplacement: c.emplacement, description: c.description,
+        poids: c.poids, type_colis: c.type_colis, statut: c.statut,
+        dims: [c.longueur, c.largeur, c.hauteur].filter(Boolean).join('×'),
+        rang: i + 1, total: colis.length,
+      })),
     });
   } catch (e) {
     res.json({ ok: false, error: 'exception' });
