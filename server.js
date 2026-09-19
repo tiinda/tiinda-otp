@@ -1352,7 +1352,7 @@ app.get('/scan/lookup', requireScan, async (req, res) => {
     if (!db) return res.json({ ok: false, error: 'no_db' });
     const code = String(req.query.q || '').trim().toUpperCase().replace(/[^A-Z0-9\-]/g, '');
     if (!code) return res.json({ ok: false, error: 'missing' });
-    const { data: c } = await db.from('colis').select('tracking_interne, tracking_externe, statut, description, type_colis, poids, longueur, largeur, hauteur, frais_envoi, received_at, created_at, client_id')
+    const { data: c } = await db.from('colis').select('tracking_interne, tracking_externe, statut, description, type_colis, poids, longueur, largeur, hauteur, frais_envoi, emplacement, received_at, created_at, client_id')
       .or('tracking_interne.eq.' + code + ',tracking_externe.eq.' + code).limit(1).maybeSingle();
     if (!c) return res.json({ ok: false, error: 'colis_introuvable' });
     let client = null;
@@ -1399,6 +1399,7 @@ app.post('/admin/measure', requireScan, async (req, res) => {
     };
     if (frais != null) patch.frais_envoi = frais;
     if (b.description) patch.description = b.description;
+    if (b.emplacement) patch.emplacement = String(b.emplacement).trim().toUpperCase().slice(0, 12);
     const { data, error } = await db.from('colis').update(patch).eq('id', colis.id).select().single();
     if (error) { console.error('measure error:', error.message); return res.json({ ok: false, error: 'update_failed' }); }
     // Notifie le client (colis reçu + mesuré + prix d'expédition).
