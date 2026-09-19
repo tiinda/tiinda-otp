@@ -1367,6 +1367,67 @@ app.get('/scan/lookup', requireScan, async (req, res) => {
   }
 });
 
+/* ── Attribution automatique d'une place ──────────────────────────────────
+   Dépôt Drancy : 5 allées (A→E) × 5 rayonnages × 5 étages × 4 places = 500.
+   Code : ALLEE-RAYONNAGE-ETAGEPLACE, ex. « B-03-42 » (étage 4, place 2).
+   L'employé ne choisit pas : le serveur propose la première place libre
+   adaptée au poids et au type, l'employé scanne le code-barres du casier. */
+const DEPOT = { allees: ['B', 'C', 'D'], rayonnages: 5, etages: 5, places: 4 };
+const ALLEE_HORS_GABARIT = 'E';
+
+function etagesPreferes(poidsKg, type) {
+  const p = Number(poidsKg) || 0;
+  if (p > 15) return [1, 2];                       // lourd : au sol
+  if (type === 'sac' || type === 'enveloppe') return [5, 4, 3];
+  if (p < 5) return [4, 3, 5, 2];
+  return [3, 2, 4, 1, 5];
+}
+function placesCandidates(poidsKg, type) {
+  const out = [];
+  const etages = etagesPreferes(poidsKg, type);
+  const allees = (Number(poidsKg) || 0) > 60 ? [ALLEE_HORS_GABARIT] : DEPOT.allees;
+  for (const et of etages)
+    for (const al of allees)
+      for (let ray = 1; ray <= DEPOT.rayonnages; ray++)
+        for (let pl = 1; pl <= DEPOT.places; pl++)
+          out.push(`${al}-${String(ray).padStart(2, '0')}-${et}${pl}`);
+  return out;
+}
+const ETAGE_LIB = { 1: 'étage 1 — au sol', 2: 'étage 2', 3: 'étage 3 — hauteur des yeux', 4: 'étage 4', 5: 'étage 5 — en haut' };
+
+app.get('/admin/place/next', requireScan, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const poids = req.query.poids;
+    const type = String(req.query.type || '');
+    const exclure = String(req.query.exclure || '').toUpperCase();
+
+    // Places déjà occupées : colis encore physiquement au dépôt.
+    const { data: rows } = await db
+      .from('colis')
+      .select('emplacement')
+      .not('emplacement', 'is', null)
+      .in('statut', ['recu', 'a_expedier']);
+    const prises = new Set((rows || []).map((r) => String(r.emplacement || '').toUpperCase()));
+    if (exclure) prises.add(exclure);
+
+    const cand = placesCandidates(poids, type);
+    const libre = cand.find((c) => !prises.has(c));
+    const total = DEPOT.allees.length * DEPOT.rayonnages * DEPOT.etages * DEPOT.places;
+    if (!libre) return res.json({ ok: false, error: 'depot_plein' });
+
+    const et = Number(libre.slice(-2, -1));
+    res.json({
+      ok: true,
+      emplacement: libre,
+      detail: `Allée ${libre[0]} · rayonnage ${libre.slice(2, 4)} · ${ETAGE_LIB[et]}`,
+      restantes: Math.max(0, total - prises.size),
+    });
+  } catch (e) {
+    res.json({ ok: false, error: 'exception' });
+  }
+});
+
 /* Rangement seul : le colis est déjà reçu et pesé, on n'enregistre que
    l'emplacement dans le dépôt (ex. « B-04-12 »). Aucune notification client. */
 app.post('/admin/ranger', requireScan, async (req, res) => {
@@ -1464,6 +1525,8 @@ app.post('/admin/scan', requireScan, async (req, res) => {
     }
     const patch = { statut: statut };
     if (statut === 'recu') patch.received_at = new Date().toISOString();
+    // Place libérée dès que le colis quitte le dépôt France.
+    if (['expedie', 'arrive', 'disponible', 'livre'].includes(statut)) patch.emplacement = null;
     if (b.signature_url) patch.signature_url = b.signature_url;
     if (b.photo_url) patch.photo_url = b.photo_url;
     const { data, error } = await db.from('colis').update(patch).eq('id', colis.id).select().single();
