@@ -1367,6 +1367,31 @@ app.get('/scan/lookup', requireScan, async (req, res) => {
   }
 });
 
+/* Rangement seul : le colis est déjà reçu et pesé, on n'enregistre que
+   l'emplacement dans le dépôt (ex. « B-04-12 »). Aucune notification client. */
+app.post('/admin/ranger', requireScan, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const b = req.body || {};
+    const code = String(b.code || '').trim();
+    const emplacement = String(b.emplacement || '').trim().toUpperCase().slice(0, 12);
+    if (!code || !emplacement) return res.json({ ok: false, error: 'params' });
+
+    const { data: colis } = await db
+      .from('colis')
+      .select('id, tracking_interne, statut, emplacement')
+      .or(`tracking_interne.eq.${code},tracking_externe.eq.${code}`)
+      .maybeSingle();
+    if (!colis) return res.json({ ok: false, error: 'colis_introuvable' });
+
+    const { error } = await db.from('colis').update({ emplacement }).eq('id', colis.id);
+    if (error) return res.json({ ok: false, error: 'db' });
+    res.json({ ok: true, emplacement, tracking_interne: colis.tracking_interne });
+  } catch (e) {
+    res.json({ ok: false, error: 'exception' });
+  }
+});
+
 // Réception & mesure : enregistre type, dimensions, poids → transmis admin + client.
 app.post('/admin/measure', requireScan, async (req, res) => {
   try {
