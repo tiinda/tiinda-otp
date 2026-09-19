@@ -1332,6 +1332,20 @@ async function notifyColisStatus(clientId, colis) {
   }
 }
 
+/* ── Verrou d'ordre du parcours colis ──────────────────────────────────────
+   Un scan ne peut que faire AVANCER le colis. Retour en arrière ou re-scan
+   de la même étape : refusé, et le client n'est pas notifié. Un responsable
+   peut forcer avec le code SCAN_OVERRIDE_CODE (variable d'environnement). */
+const SCAN_ORDER = { declare: 0, recu: 1, a_expedier: 1, expedie: 2, arrive: 3, disponible: 4, livre: 5 };
+function scanRank(s) {
+  const r = SCAN_ORDER[String(s || '').toLowerCase()];
+  return r === undefined ? -1 : r;
+}
+const SCAN_OVERRIDE_CODE = process.env.SCAN_OVERRIDE_CODE || '';
+function scanForced(b) {
+  return !!SCAN_OVERRIDE_CODE && String((b && b.override_code) || '') === SCAN_OVERRIDE_CODE;
+}
+
 // (EMPLOYÉ) Recherche d'un colis par numéro → statut + infos (lecture seule).
 app.get('/scan/lookup', requireScan, async (req, res) => {
   try {
@@ -1363,8 +1377,10 @@ app.post('/admin/measure', requireScan, async (req, res) => {
     const { data: colis } = await db.from('colis').select('id, statut, client_id, tracking_interne, received_at')
       .or('tracking_interne.eq.' + code + ',tracking_externe.eq.' + code).limit(1).maybeSingle();
     if (!colis) return res.json({ ok: false, error: 'colis_introuvable' });
-    // Bloque la double réception/mesure.
-    if (colis.statut === 'recu' || colis.received_at) return res.json({ ok: false, error: 'deja_mesure' });
+    // Bloque la double réception/mesure (sauf code responsable).
+    if ((colis.statut === 'recu' || colis.received_at) && !scanForced(b)) {
+      return res.json({ ok: false, error: 'deja_mesure', recu_le: colis.received_at || null, statut_actuel: colis.statut });
+    }
     const num = function (x) { return (x === '' || x == null) ? null : Number(x); };
     const L = num(b.longueur), W = num(b.largeur), H = num(b.hauteur), kg = num(b.poids);
     // ── Calcul du prix d'expédition Congo (même formule que la calculette) ──
@@ -1407,8 +1423,19 @@ app.post('/admin/scan', requireScan, async (req, res) => {
     const { data: colis } = await db.from('colis').select('id, statut, client_id, tracking_interne, description')
       .or('tracking_interne.eq.' + code + ',tracking_externe.eq.' + code).limit(1).maybeSingle();
     if (!colis) return res.json({ ok: false, error: 'colis_introuvable' });
-    // Bloque le double scan : si déjà à ce statut, on prévient.
-    if (colis.statut === statut) return res.json({ ok: false, error: 'deja_scanne', statut: statut });
+    // Verrou d'ordre : ni retour en arrière, ni re-scan de la même étape.
+    {
+      const rc = scanRank(colis.statut), rt = scanRank(statut);
+      if (rc >= 0 && rt >= 0 && rc >= rt && !scanForced(b)) {
+        return res.json({
+          ok: false,
+          error: rc === rt ? 'deja_scanne' : 'ordre_invalide',
+          statut: statut,
+          statut_actuel: colis.statut,
+        });
+      }
+      if (scanForced(b)) console.warn('scan forcé:', colis.tracking_interne, colis.statut, '->', statut);
+    }
     const patch = { statut: statut };
     if (statut === 'recu') patch.received_at = new Date().toISOString();
     if (b.signature_url) patch.signature_url = b.signature_url;
