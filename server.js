@@ -1363,7 +1363,7 @@ app.get('/scan/lookup', requireScan, async (req, res) => {
     if (!db) return res.json({ ok: false, error: 'no_db' });
     const code = String(req.query.q || '').trim().toUpperCase().replace(/[^A-Z0-9\-]/g, '');
     if (!code) return res.json({ ok: false, error: 'missing' });
-    const { data: c } = await db.from('colis').select('tracking_interne, tracking_externe, statut, description, type_colis, poids, longueur, largeur, hauteur, frais_envoi, emplacement, received_at, created_at, client_id')
+    const { data: c } = await db.from('colis').select('tracking_interne, tracking_externe, statut, description, type_colis, poids, longueur, largeur, hauteur, frais_envoi, emplacement, picking, received_at, created_at, client_id')
       .or('tracking_interne.eq.' + code + ',tracking_externe.eq.' + code).limit(1).maybeSingle();
     if (!c) return res.json({ ok: false, error: 'colis_introuvable' });
     let client = null;
@@ -1422,6 +1422,19 @@ app.get('/admin/place/next', requireScan, async (req, res) => {
     const prises = new Set((rows || []).map((r) => String(r.emplacement || '').toUpperCase()));
     if (exclure) prises.add(exclure);
 
+    /* Pas de quarantaine par défaut : un casier vidé se réutilise aussitôt.
+       Mettre PLACE_QUARANTAINE_H sur Render pour en imposer une. */
+    const QUARANTAINE_H = Number(process.env.PLACE_QUARANTAINE_H || 0);
+    if (QUARANTAINE_H > 0) {
+      const depuis = new Date(Date.now() - QUARANTAINE_H * 3600 * 1000).toISOString();
+      const { data: recents } = await db
+        .from('colis')
+        .select('emplacement_prec')
+        .not('emplacement_prec', 'is', null)
+        .gte('libere_le', depuis);
+      (recents || []).forEach((r) => prises.add(String(r.emplacement_prec || '').toUpperCase()));
+    }
+
     const cand = placesCandidates(poids, type);
     const libre = cand.find((c) => !prises.has(c));
     const total = DEPOT.allees.length * DEPOT.rayonnages * DEPOT.etages * DEPOT.places;
@@ -1441,6 +1454,8 @@ app.get('/admin/place/next', requireScan, async (req, res) => {
 
 /* (EMPLOYÉ) Bons de préparation en attente — le poste Départ de Drancy les
    affiche et imprime automatiquement les nouveaux. */
+/* Bons en attente : uniquement ceux dont il reste des colis à sortir.
+   Un bon entièrement expédié disparaît et ne peut plus être rouvert. */
 app.get('/admin/picking/pending', requireScan, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
@@ -1499,7 +1514,7 @@ app.get('/admin/picking', requireScan, async (req, res) => {
     res.json({
       ok: true,
       picking: num,
-      statut: colis.every((c) => c.statut !== 'a_expedier') ? 'traite' : 'a_preparer',
+      statut: colis.some((c) => c.statut === 'a_expedier') ? 'a_preparer' : 'traite',
       client: cl || {},
       colis: colis.map((c, i) => ({
         code: c.tracking_interne, emplacement: c.emplacement, description: c.description,
@@ -1529,6 +1544,14 @@ app.post('/admin/ranger', requireScan, async (req, res) => {
       .or(`tracking_interne.eq.${code},tracking_externe.eq.${code}`)
       .maybeSingle();
     if (!colis) return res.json({ ok: false, error: 'colis_introuvable' });
+
+    const { data: occupe } = await db.from('colis')
+      .select('tracking_interne')
+      .eq('emplacement', emplacement)
+      .in('statut', ['recu', 'a_expedier'])
+      .neq('id', colis.id)
+      .limit(1).maybeSingle();
+    if (occupe) return res.json({ ok: false, error: 'casier_occupe', par: occupe.tracking_interne });
 
     const { error } = await db.from('colis').update({ emplacement }).eq('id', colis.id);
     if (error) return res.json({ ok: false, error: 'db' });
@@ -1570,7 +1593,17 @@ app.post('/admin/measure', requireScan, async (req, res) => {
     };
     if (frais != null) patch.frais_envoi = frais;
     if (b.description) patch.description = b.description;
-    if (b.emplacement) patch.emplacement = String(b.emplacement).trim().toUpperCase().slice(0, 12);
+    if (b.emplacement) {
+      const empl = String(b.emplacement).trim().toUpperCase().slice(0, 12);
+      const { data: pris } = await db.from('colis')
+        .select('tracking_interne')
+        .eq('emplacement', empl)
+        .in('statut', ['recu', 'a_expedier'])
+        .neq('id', colis.id)
+        .limit(1).maybeSingle();
+      if (pris) return res.json({ ok: false, error: 'casier_occupe', par: pris.tracking_interne });
+      patch.emplacement = empl;
+    }
     const { data, error } = await db.from('colis').update(patch).eq('id', colis.id).select().single();
     if (error) { console.error('measure error:', error.message); return res.json({ ok: false, error: 'update_failed' }); }
     // Notifie le client (colis reçu + mesuré + prix d'expédition).
@@ -1610,8 +1643,14 @@ app.post('/admin/scan', requireScan, async (req, res) => {
     }
     const patch = { statut: statut };
     if (statut === 'recu') patch.received_at = new Date().toISOString();
-    // Place libérée dès que le colis quitte le dépôt France.
-    if (['expedie', 'arrive', 'disponible', 'livre'].includes(statut)) patch.emplacement = null;
+    /* Place libérée dès que le colis quitte le dépôt France. On garde l'ancien
+       casier et l'heure : il reste en quarantaine quelques heures pour ne pas
+       être réattribué à un colis pendant qu'on le sort encore du rayonnage. */
+    if (['expedie', 'arrive', 'disponible', 'livre'].includes(statut) && colis.emplacement) {
+      patch.emplacement = null;
+      patch.emplacement_prec = colis.emplacement;
+      patch.libere_le = new Date().toISOString();
+    }
     if (b.signature_url) patch.signature_url = b.signature_url;
     if (b.photo_url) patch.photo_url = b.photo_url;
     const { data, error } = await db.from('colis').update(patch).eq('id', colis.id).select().single();
