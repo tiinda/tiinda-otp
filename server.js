@@ -66,6 +66,14 @@ app.post('/webhook/order-paid', express.raw({ type: '*/*' }), async (req, res) =
     const order = JSON.parse(req.body.toString('utf8'));
     // 🔒 Sécurité : on ignore les commandes de TEST (carte 4242…) → pas de crédit fictif.
     if (order.test === true) { console.log('webhook: commande TEST ignorée'); return; }
+
+    /* ── Coolibo : le numéro de suivi n'existe qu'ici ────────────────────────
+       La page /envoi ne crée plus rien : elle range le descriptif du colis
+       dans la propriété _coolibo de la ligne de commande. Le numéro CLB est
+       généré au paiement encaissé, une seule fois par commande (clé
+       shopify_order + index unique côté base). */
+    await coolliboDepuisCommande(order);
+
     const email = (order.email || (order.customer && order.customer.email) || '').trim().toLowerCase();
     if (!email) return;
     const { data: cli } = await db.from('clients').select('id, prenom, email, wallet_balance').ilike('email', email).limit(1).maybeSingle();
@@ -88,6 +96,78 @@ app.post('/webhook/order-paid', express.raw({ type: '*/*' }), async (req, res) =
     console.error('webhook order-paid error:', err.message);
   }
 });
+
+/* Génère « CLB-2026-7KPYIW » — année + 6 caractères base36. */
+function genTrackingCoolibo() {
+  const y = new Date().getFullYear();
+  let r = '';
+  const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const b = crypto.randomBytes(6);
+  for (let i = 0; i < 6; i++) r += A[b[i] % A.length];
+  return 'CLB-' + y + '-' + r;
+}
+
+async function coolliboDepuisCommande(order) {
+  try {
+    if (!db) return;
+    const ref = 'SHOP-' + (order.id || order.order_number || '');
+    if (ref === 'SHOP-') return;
+
+    /* Idempotence : un webhook rejoué ne recrée rien. */
+    const { data: deja } = await db.from('envois_coolibo')
+      .select('id').eq('shopify_order', ref).limit(1).maybeSingle();
+    if (deja) { console.log('coolibo: commande déjà traitée', ref); return; }
+
+    const email = (order.email || (order.customer && order.customer.email) || '').trim().toLowerCase();
+    const lignes = [];
+
+    (order.line_items || []).forEach(function (it) {
+      const props = it.properties || [];
+      const brut = (props.find ? props.find((p) => p && p.name === '_coolibo') : null);
+      if (!brut || !brut.value) return;
+      let d;
+      try { d = JSON.parse(brut.value); } catch (e) { return; }
+
+      const n = Math.max(1, parseInt(d.qty, 10) || 1);
+      for (let i = 0; i < n; i++) {
+        lignes.push({
+          tracking_interne: genTrackingCoolibo(),
+          statut: 'paye',
+          shopify_order: ref,
+          mode: d.mode || null,
+          relais: d.relais || null,
+          relais_id: d.relaisId || null,
+          carton: d.carton || null,
+          longueur: d.l != null ? Number(d.l) : null,
+          largeur: d.w != null ? Number(d.w) : null,
+          hauteur: d.h != null ? Number(d.h) : null,
+          poids: d.kg != null ? Number(d.kg) : null,
+          valeur: d.declared != null ? Number(d.declared) : null,
+          zip: d.zip || null,
+          ville: d.city || null,
+          email: email || null,
+          nb_colis: n,
+          frais_envoi: d.total != null ? Number(d.total) : null,
+          type_colis: d.type || 'carton',
+        });
+      }
+    });
+
+    if (!lignes.length) return;   // commande sans envoi Coolibo
+
+    const { error } = await db.from('envois_coolibo').insert(lignes);
+    if (error) {
+      /* 23505 = doublon sur shopify_order : deux webhooks en parallèle. */
+      if (String(error.code) === '23505') { console.log('coolibo: doublon évité', ref); return; }
+      console.error('coolibo insert:', error.message);
+      return;
+    }
+    console.log('coolibo: ' + lignes.length + ' envoi(s) créé(s) pour ' + ref +
+      ' → ' + lignes.map((l) => l.tracking_interne).join(', '));
+  } catch (e) {
+    console.error('coolibo webhook error:', e.message);
+  }
+}
 
 app.use(express.json());
 app.set('trust proxy', true);
@@ -1447,6 +1527,23 @@ app.get('/admin/place/next', requireScan, async (req, res) => {
       detail: `Allée ${libre[0]} · rayonnage ${libre.slice(2, 4)} · ${ETAGE_LIB[et]}`,
       restantes: Math.max(0, total - prises.size),
     });
+  } catch (e) {
+    res.json({ ok: false, error: 'exception' });
+  }
+});
+
+/* (CLIENT) Numéros de suivi Coolibo d'une commande, après paiement.
+   Permet à la page de confirmation d'afficher les CLB générés par le webhook. */
+app.get('/coolibo/commande/:ref', async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const ref = 'SHOP-' + String(req.params.ref || '').replace(/[^0-9]/g, '');
+    if (ref === 'SHOP-') return res.json({ ok: false, error: 'params' });
+    const { data } = await db.from('envois_coolibo')
+      .select('tracking_interne, mode, ville, frais_envoi, statut')
+      .eq('shopify_order', ref)
+      .order('tracking_interne', { ascending: true });
+    res.json({ ok: true, envois: data || [] });
   } catch (e) {
     res.json({ ok: false, error: 'exception' });
   }
