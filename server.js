@@ -1773,6 +1773,19 @@ app.post('/admin/measure', requireScan, async (req, res) => {
       longueur: L, largeur: W, hauteur: H, poids: kg,
       statut: 'recu', received_at: new Date().toISOString(),
     };
+    /* Poids annoncé par le client à la commande : on le fige avant que la
+       pesée ne l'écrase, et on enregistre l'écart. Aucune refacturation
+       automatique — l'administrateur tranche depuis le tableau de bord. */
+    const decl = (colis.poids_declare != null) ? Number(colis.poids_declare)
+               : (colis.poids != null ? Number(colis.poids) : null);
+    if (colis.poids_declare == null && decl != null) patch.poids_declare = decl;
+    if (decl != null && kg != null) {
+      const e = Math.round((kg - decl) * 100) / 100;
+      patch.ecart_poids = e;
+      if (Math.abs(e) > 0.5) {
+        console.warn('écart de poids', colis.tracking_interne, 'déclaré', decl, '→ pesé', kg, '(' + e + ' kg)');
+      }
+    }
     /* Coolibo achemine en France : le prix est déjà payé à la commande,
        la pesée à Drancy ne le recalcule pas. */
     if (frais != null && !estCoolibo(code)) patch.frais_envoi = frais;
