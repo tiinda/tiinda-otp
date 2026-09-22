@@ -1461,7 +1461,9 @@ async function casiersPris() {
       .not('emplacement', 'is', null).in('statut', ['recu', 'a_expedier']),
   ]);
   lots.forEach(({ data }) => (data || []).forEach((r) => {
-    pris.set(String(r.emplacement || '').toUpperCase(), r.tracking_interne);
+    const e = String(r.emplacement || '').toUpperCase();
+    if (!e || /^CONT-/.test(e)) return;   // zone conteneur : plusieurs colis admis
+    pris.set(e, r.tracking_interne);
   }));
   return pris;
 }
@@ -1545,10 +1547,38 @@ function placesCandidates(poidsKg, type) {
 }
 const ETAGE_LIB = { 1: 'étage 1 — au sol', 2: 'étage 2', 3: 'étage 3 — hauteur des yeux', 4: 'étage 4', 5: 'étage 5 — en haut' };
 
+/* Conteneur maritime Coolibo : trois zones, une par ville desservie.
+   Un colis Coolibo ne va jamais au rayonnage — il part dans le conteneur,
+   dans la zone de sa ville de destination. Une zone accueille des dizaines
+   de colis : pas d'unicité à vérifier, contrairement aux casiers Tiinda. */
+const ZONES_COOLIBO = {
+  'POINTE-NOIRE': { code: 'CONT-PNR', nom: 'Pointe-Noire' },
+  'DOLISIE':      { code: 'CONT-DLS', nom: 'Dolisie' },
+  'BRAZZAVILLE':  { code: 'CONT-BZV', nom: 'Brazzaville' },
+};
+function zoneCoolibo(ville) {
+  const v = String(ville || '').trim().toUpperCase().replace(/\s+/g, '-');
+  return ZONES_COOLIBO[v] || null;
+}
+
 app.get('/admin/place/next', requireScan, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
     const poids = req.query.poids;
+
+    const codeQ = String(req.query.code || '').trim().toUpperCase();
+    if (estCoolibo(codeQ)) {
+      const { data: e } = await db.from('envois_coolibo').select('dest_ville, tracking_interne')
+        .eq('tracking_interne', codeQ).limit(1).maybeSingle();
+      const z = zoneCoolibo(e && e.dest_ville);
+      if (!z) return res.json({ ok: false, error: 'destination_inconnue' });
+      return res.json({
+        ok: true,
+        emplacement: z.code,
+        detail: 'Conteneur · zone ' + z.nom,
+        zone: z.nom,
+      });
+    }
     const type = String(req.query.type || '');
     const exclure = String(req.query.exclure || '').toUpperCase();
 
@@ -1697,9 +1727,11 @@ app.post('/admin/ranger', requireScan, async (req, res) => {
       .maybeSingle();
     if (!colis) return res.json({ ok: false, error: 'colis_introuvable' });
 
-    const occupant = (await casiersPris()).get(emplacement);
-    if (occupant && occupant !== colis.tracking_interne) {
-      return res.json({ ok: false, error: 'casier_occupe', par: occupant });
+    if (!/^CONT-/.test(emplacement)) {
+      const occupant = (await casiersPris()).get(emplacement);
+      if (occupant && occupant !== colis.tracking_interne) {
+        return res.json({ ok: false, error: 'casier_occupe', par: occupant });
+      }
     }
 
     const { error } = await db.from(table).update({ emplacement }).eq('id', colis.id);
@@ -1747,9 +1779,11 @@ app.post('/admin/measure', requireScan, async (req, res) => {
     if (b.description) patch.description = b.description;
     if (b.emplacement) {
       const empl = String(b.emplacement).trim().toUpperCase().slice(0, 12);
-      const occupant = (await casiersPris()).get(empl);
-      if (occupant && occupant !== colis.tracking_interne) {
-        return res.json({ ok: false, error: 'casier_occupe', par: occupant });
+      if (!/^CONT-/.test(empl)) {
+        const occupant = (await casiersPris()).get(empl);
+        if (occupant && occupant !== colis.tracking_interne) {
+          return res.json({ ok: false, error: 'casier_occupe', par: occupant });
+        }
       }
       patch.emplacement = empl;
     }
