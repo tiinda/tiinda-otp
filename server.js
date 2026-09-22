@@ -145,6 +145,11 @@ async function coolliboDepuisCommande(order) {
           valeur: d.declared != null ? Number(d.declared) : null,
           zip: d.zip || null,
           ville: d.city || null,
+          dest_nom: d.destNom || null,
+          dest_phone: d.destTel || null,
+          dest_ville: d.destVille || null,
+          dest_quartier: d.destQuartier || null,
+          dest_mode: d.destMode || null,
           email: email || null,
           nb_colis: n,
           frais_envoi: d.total != null ? Number(d.total) : null,
@@ -1485,8 +1490,14 @@ app.get('/scan/lookup', requireScan, async (req, res) => {
           received_at: e.received_at || null, created_at: e.created_at,
         },
         client: {
-          nom: e.email || '', tiinda_id: dom ? 'Coolibo · domicile' : 'Coolibo · point relais',
-          phone: '', ville: [e.zip, e.ville].filter(Boolean).join(' '),
+          nom: e.dest_nom || e.email || '',
+          tiinda_id: dom ? 'Coolibo · domicile' : 'Coolibo · point relais',
+          phone: e.dest_phone || '',
+          ville: [e.zip, e.ville].filter(Boolean).join(' '),
+        },
+        destination: {
+          ville: e.dest_ville || '', quartier: e.dest_quartier || '',
+          mode: e.dest_mode || '', nom: e.dest_nom || '', phone: e.dest_phone || '',
         },
       });
     }
