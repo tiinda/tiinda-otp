@@ -169,6 +169,7 @@ async function coolliboDepuisCommande(order) {
     }
     console.log('coolibo: ' + lignes.length + ' envoi(s) créé(s) pour ' + ref +
       ' → ' + lignes.map((l) => l.tracking_interne).join(', '));
+    envoyerEtiquetteCoolibo(email, lignes).catch(function () {});
   } catch (e) {
     console.error('coolibo webhook error:', e.message);
   }
@@ -1613,6 +1614,156 @@ app.get('/admin/place/next', requireScan, async (req, res) => {
     });
   } catch (e) {
     res.json({ ok: false, error: 'exception' });
+  }
+});
+
+/* Le client reçoit son étiquette dès l'encaissement : un lien par colis,
+   plus la marche à suivre selon son mode d'envoi. */
+async function envoyerEtiquetteCoolibo(email, lignes) {
+  if (!RESEND_API_KEY || !email || !lignes || !lignes.length) return;
+  const base = (process.env.SITE_URL || 'https://tiinda-otp.onrender.com').replace(/\/$/, '');
+  const relais = lignes[0].mode === 'relais';
+  const boutons = lignes.map((l) =>
+    '<div style="margin:10px 0"><a href="' + base + '/coolibo/etiquette/' + l.tracking_interne + '"'
+    + ' style="display:inline-block;background:#0B2A5B;color:#fff;text-decoration:none;'
+    + 'padding:14px 24px;border-radius:10px;font-weight:700">Imprimer l\u2019étiquette '
+    + l.tracking_interne + '</a></div>').join('');
+  const suite = relais
+    ? '<p style="color:#42556f;line-height:1.6">Collez l\u2019étiquette sur votre colis, puis déposez-le '
+      + 'dans votre point relais Mondial Relay avec l\u2019étiquette transporteur que vous recevrez séparément.</p>'
+    : '<p style="color:#42556f;line-height:1.6">Collez l\u2019étiquette sur votre colis. Notre équipe vient '
+      + 'le récupérer à l\u2019adresse indiquée, au créneau que vous choisirez.</p>';
+  const html = '<div style="font-family:Arial,Helvetica,sans-serif;max-width:540px;margin:auto;color:#16243d">'
+    + '<div style="background:#0B2A5B;color:#fff;padding:20px;border-radius:12px 12px 0 0">'
+    + '<strong style="font-size:19px">Coolibo · votre envoi est confirmé</strong></div>'
+    + '<div style="border:1px solid #e3e7ef;border-top:none;border-radius:0 0 12px 12px;padding:22px">'
+    + '<p style="margin-top:0;color:#42556f;line-height:1.6">Merci, votre paiement est bien reçu. '
+    + 'Voici votre étiquette à imprimer et à coller sur le colis.</p>'
+    + boutons + suite
+    + '<p style="color:#8a97ad;font-size:13px;margin-bottom:0">Conservez ce message : le lien reste valable '
+    + 'jusqu\u2019à la livraison.</p></div></div>';
+  try {
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: MAIL_FROM || 'Coolibo <onboarding@resend.dev>', to: email,
+        subject: 'Coolibo · votre étiquette (' + lignes.map((l) => l.tracking_interne).join(', ') + ')',
+        html,
+      }),
+    });
+  } catch (e) { console.error('coolibo mail error:', e.message); }
+}
+
+/* ── Étiquette Coolibo à imprimer par le client ───────────────────────────
+   Servie directement par le serveur : le numéro CLB fait office de clé, il
+   n'est connu que du client qui a payé. Page A4, prête à imprimer, à coller
+   sur le colis avant dépôt en point relais ou enlèvement à domicile. */
+const C128_TBL = ('212222 222122 222221 121223 121322 131222 122213 122312 132212 221213 ' +
+  '221312 231212 112232 122132 122231 113222 123122 123221 223211 221132 221231 ' +
+  '213212 223112 312131 311222 321122 321221 312212 322112 322211 212123 212321 ' +
+  '232121 111323 131123 131321 112313 132113 132311 211313 231113 231311 112133 ' +
+  '112331 132131 113123 113321 133121 313121 211331 231131 213113 213311 213131 ' +
+  '311123 311321 331121 312113 312311 332111 314111 221411 431111 111224 111422 ' +
+  '121124 121421 141122 141221 112214 112412 122114 122411 142112 142211 241211 ' +
+  '221114 413111 241112 134111 111242 121142 121241 114212 124112 124211 411212 ' +
+  '421112 421211 212141 214121 412121 111143 111341 131141 114113 114311 411113 ' +
+  '411311 113141 114131 311141 411131 211412 211214 211232 2331112').split(' ');
+
+function barresSVG(txt, wmm, hmm) {
+  const codes = [104];
+  for (let i = 0; i < txt.length; i++) codes.push(txt.charCodeAt(i) - 32);
+  let som = 104;
+  for (let i = 1; i < codes.length; i++) som += codes[i] * i;
+  codes.push(som % 103); codes.push(106);
+  const m = codes.map((c) => C128_TBL[c]).join('');
+  let tot = 0; for (const ch of m) tot += +ch;
+  let x = 0, out = '';
+  for (let i = 0; i < m.length; i++) {
+    const w = +m[i];
+    if (i % 2 === 0) out += `<rect x="${x}" y="0" width="${w}" height="100" fill="#000"/>`;
+    x += w;
+  }
+  return `<svg viewBox="0 0 ${tot} 100" preserveAspectRatio="none" style="width:${wmm}mm;height:${hmm}mm;display:block">${out}</svg>`;
+}
+
+const htmlEsc = (t) => String(t == null ? '' : t)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+app.get('/coolibo/etiquette/:code', async (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
+    if (!db || !/^CLB-\d{4}-[A-Z0-9]{6}$/.test(code)) return res.status(404).send('Étiquette introuvable.');
+    const { data: e } = await db.from('envois_coolibo').select('*')
+      .eq('tracking_interne', code).limit(1).maybeSingle();
+    if (!e) return res.status(404).send('Étiquette introuvable.');
+
+    const relais = e.mode === 'relais';
+    const consigne = relais
+      ? 'Collez cette étiquette sur le colis, puis déposez-le dans votre point relais Mondial Relay avec l’étiquette transporteur.'
+      : 'Collez cette étiquette sur le colis. Notre équipe vient le récupérer à l’adresse indiquée, au créneau que vous avez choisi.';
+    const dFR = (v) => { try { return new Date(v).toLocaleDateString('fr-FR',
+      { day: '2-digit', month: '2-digit', year: 'numeric' }); } catch (e) { return ''; } };
+    const emiseLe = dFR(e.created_at || Date.now());
+    const ligne = (k, v) => `<tr><td style="padding:2mm 0;color:#6a7891;font-size:10pt;width:38mm">${htmlEsc(k)}</td>
+      <td style="padding:2mm 0;font-size:12pt;font-weight:700">${htmlEsc(v || '—')}</td></tr>`;
+
+    res.set('Content-Type', 'text/html; charset=utf-8').send(`<!doctype html><html lang="fr"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Étiquette ${code} · Coolibo</title><style>
+  @page{size:A4 portrait;margin:0}
+  *{box-sizing:border-box;font-family:Arial,Helvetica,sans-serif;color:#000}
+  body{margin:0;background:#eef0f5;display:flex;flex-direction:column;align-items:center;padding:18px;gap:14px}
+  .barre{width:210mm;display:flex;justify-content:space-between;align-items:center;gap:14px}
+  .barre b{font-size:16px}.barre p{margin:2px 0 0;font-size:13px;color:#42556f}
+  button{background:#0B2A5B;color:#fff;border:none;border-radius:10px;padding:13px 22px;
+    font-size:14px;font-weight:800;cursor:pointer}
+  .page{width:210mm;min-height:297mm;background:#fff;padding:18mm 16mm;box-shadow:0 14px 40px rgba(0,0,0,.18)}
+  .etq{border:0.8mm dashed #0B2A5B;border-radius:3mm;padding:8mm}
+  .cut{font-size:9pt;color:#8a97ad;margin:0 0 3mm}
+  @media print{body{background:#fff;padding:0;gap:0}.barre{display:none}
+    .page{box-shadow:none;width:auto;min-height:auto;padding:14mm}}
+</style></head><body>
+<div class="barre">
+  <div><b>Étiquette Coolibo · ${code}</b><p>Imprimez cette page, découpez le cadre et collez-le sur le colis.</p></div>
+  <button onclick="window.print()">Imprimer</button>
+</div>
+<div class="page">
+  <p class="cut">✂ Découpez le long du cadre</p>
+  <div class="etq">
+    <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:0.8mm solid #000;padding-bottom:4mm">
+      <span style="font-size:22pt;font-weight:800;letter-spacing:-.02em">Coolibo</span>
+      <span style="font-size:10pt;font-weight:700;border:0.5mm solid #000;padding:1.5mm 4mm">
+        ${relais ? 'POINT RELAIS' : 'ENLÈVEMENT À DOMICILE'}</span>
+    </div>
+
+    <div style="padding:6mm 0 4mm;border-bottom:0.4mm solid #000">
+      <div style="font-size:9pt;color:#6a7891;text-transform:uppercase;letter-spacing:.08em">Destination</div>
+      <div style="font-size:30pt;font-weight:800;line-height:1.05;letter-spacing:-.02em">
+        ${htmlEsc(e.dest_ville || 'Congo')}</div>
+      <div style="font-size:12pt;font-weight:700;margin-top:1mm">${htmlEsc(e.dest_nom || '')}
+        ${e.dest_phone ? ' · ' + htmlEsc(e.dest_phone) : ''}</div>
+    </div>
+
+    <table style="width:100%;border-collapse:collapse;margin:3mm 0">
+      ${ligne('Expéditeur', e.email || '')}
+      ${ligne('Enlèvement', [e.zip, e.ville].filter(Boolean).join(' '))}
+      ${ligne('Format', e.carton || '—')}
+      ${ligne('Émise le', emiseLe)}
+      ${ligne('Remise', e.dest_mode === 'domicile' ? ('Livraison à domicile' + (e.dest_quartier ? ' · ' + e.dest_quartier : '')) : 'Retrait à l’agence')}
+    </table>
+
+    <div style="display:flex;flex-direction:column;align-items:center;gap:2mm;border-top:0.4mm solid #000;padding-top:5mm">
+      ${barresSVG(code, 120, 26)}
+      <span style="font-family:monospace;font-size:17pt;font-weight:700;letter-spacing:.14em">${code}</span>
+      <span style="font-size:9pt;color:#6a7891">Dépôt Colispo · 3 rue de la Butte, 93700 Drancy</span>
+    </div>
+  </div>
+  <p style="font-size:11pt;line-height:1.6;color:#42556f;margin:8mm 0 0">${consigne}</p>
+</div>
+</body></html>`);
+  } catch (e) {
+    res.status(500).send('Erreur.');
   }
 });
 
