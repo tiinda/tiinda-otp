@@ -83,6 +83,7 @@ app.post('/webhook/order-paid', express.raw({ type: '*/*' }), async (req, res) =
           (avant : 9,99 € arrondi à 10 → +10 € de crédit par erreur). */
     const lignesForfait = [];
     let creditTotal = 0;
+    let creditPaye = 0;
     (order.line_items || []).forEach(function (it) {
       const texte = (it.sku || '') + ' ' + (it.title || '') + ' ' + (it.name || '') + ' ' + (it.handle || '');
       const forfait = forfaitDepuisTexte(texte);
@@ -95,7 +96,10 @@ app.post('/webhook/order-paid', express.raw({ type: '*/*' }), async (req, res) =
       let base = 0;
       if (m) base = Number(m[1]);
       else { const p = Math.round(Number(it.price || 0)); if (CREDIT_BONUS[p] != null) base = p; }
-      if (base) creditTotal += base * (it.quantity || 1) * (1 + (CREDIT_BONUS[base] || 0));
+      if (base) {
+        creditTotal += base * (it.quantity || 1) * (1 + (CREDIT_BONUS[base] || 0));
+        creditPaye += Number(it.price || base) * (it.quantity || 1);
+      }
     });
     if (!lignesForfait.length && creditTotal <= 0) return; // ni forfait ni crédit (ex. Coolibo seul)
 
@@ -130,6 +134,10 @@ app.post('/webhook/order-paid', express.raw({ type: '*/*' }), async (req, res) =
       const newBal = Number((frais && frais.wallet_balance) || 0) + creditTotal;
       await db.from('clients').update({ wallet_balance: newBal }).eq('id', cli.id);
       console.log('webhook: +' + creditTotal + ' € → ' + cli.tiinda_id + ' (solde ' + newBal + ')');
+      const paye = Math.round(creditPaye * 100) / 100;
+      const libRec = 'Recharge du solde Tiinda par carte bancaire'
+        + (creditTotal > paye ? ' (crédit ' + creditTotal.toFixed(2) + ' € avec bonus)' : '');
+      emitInvoice(cli.id, libRec, paye || creditTotal, orderRef + '-CREDIT', 'TND-REC').catch(function(){});
     }
   } catch (err) {
     console.error('webhook order-paid error:', err.message);
@@ -2433,11 +2441,14 @@ app.post('/password/change', requireAuth, async (req, res) => {
 
 // Activité récente du client : événements dérivés des colis + recharges.
 // ── FACTURES ───────────────────────────────────────────────────────────────
-async function emitInvoice(clientId, description, montant, ref) {
+/* prefixe 'TND-INV' = facture ; 'TND-REC' = reçu de recharge du solde.
+   Chaque série a sa propre numérotation continue. */
+async function emitInvoice(clientId, description, montant, ref, prefixe) {
   if (!db || !clientId) return null;
+  const pre = prefixe || 'TND-INV';
   const year = new Date().getFullYear();
-  const { count } = await db.from('factures').select('id', { count: 'exact', head: true });
-  const num = 'TND-INV-' + year + '-' + String((count || 0) + 1).padStart(4, '0');
+  const { count } = await db.from('factures').select('id', { count: 'exact', head: true }).like('numero', pre + '-%');
+  const num = pre + '-' + year + '-' + String((count || 0) + 1).padStart(4, '0');
   const { data, error } = await db.from('factures').insert({
     client_id: clientId, numero: num, description: description || 'Service Tiinda',
     montant: Number(montant || 0), ref: ref || null, statut: 'emise',
@@ -2634,6 +2645,7 @@ app.post('/wallet/redeem', requireAuth, async (req, res) => {
       .select('id');
     if (!pris || !pris.length) return res.json({ ok: false, error: 'code_deja_utilise' });
     const newBal = await creditWallet(cli.id, rc.montant, 'code', code);
+    emitInvoice(cli.id, 'Recharge du solde Tiinda par code ' + code, rc.montant, 'CODE-' + code, 'TND-REC').catch(function(){});
     res.json({ ok: true, montant: Number(rc.montant), balance: newBal });
   } catch (err) {
     console.error('redeem error:', err.message);
