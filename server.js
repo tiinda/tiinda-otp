@@ -75,27 +75,171 @@ app.post('/webhook/order-paid', express.raw({ type: '*/*' }), async (req, res) =
     await coolliboDepuisCommande(order);
 
     const email = (order.email || (order.customer && order.customer.email) || '').trim().toLowerCase();
-    if (!email) return;
-    const { data: cli } = await db.from('clients').select('id, prenom, email, wallet_balance').ilike('email', email).limit(1).maybeSingle();
-    if (!cli) { console.error('webhook: client introuvable', email); return; }
+    const shopCustId = order.customer && order.customer.id ? String(order.customer.id) : '';
+    const orderRef = 'SHOP-' + (order.id || order.order_number || '');
+
+    /* 1) Tri des lignes : forfait (abonnement) ou achat de crédit.
+          Une ligne d'abonnement ne doit JAMAIS créditer le wallet
+          (avant : 9,99 € arrondi à 10 → +10 € de crédit par erreur). */
+    const lignesForfait = [];
     let creditTotal = 0;
     (order.line_items || []).forEach(function (it) {
-      const m = /credit[- ]?tiinda[- ]?(\d+)/i.exec((it.sku || '') + ' ' + (it.title || '') + ' ' + (it.handle || ''));
+      const texte = (it.sku || '') + ' ' + (it.title || '') + ' ' + (it.name || '') + ' ' + (it.handle || '');
+      const forfait = forfaitDepuisTexte(texte);
+      const estAbo = !!it.selling_plan_allocation || !!forfait;
+      if (estAbo) {
+        if (forfait) lignesForfait.push({ offre: forfait, prix: Number(it.price || 0) });
+        return;
+      }
+      const m = /credit[- ]?tiinda[- ]?(\d+)/i.exec(texte);
       let base = 0;
       if (m) base = Number(m[1]);
       else { const p = Math.round(Number(it.price || 0)); if (CREDIT_BONUS[p] != null) base = p; }
       if (base) creditTotal += base * (it.quantity || 1) * (1 + (CREDIT_BONUS[base] || 0));
     });
-    if (creditTotal <= 0) return; // pas un achat de crédit
-    creditTotal = Math.round(creditTotal * 100) / 100;
-    const newBal = Number(cli.wallet_balance || 0) + creditTotal;
-    await db.from('clients').update({ wallet_balance: newBal }).eq('id', cli.id);
-    await db.from('recharges').insert({ client_id: cli.id, montant: creditTotal, moyen: 'carte', code_recharge: 'CMD-' + (order.order_number || order.id || ''), statut: 'valide' });
-    console.log('webhook: +' + creditTotal + ' € → ' + email + ' (solde ' + newBal + ')');
+    if (!lignesForfait.length && creditTotal <= 0) return; // ni forfait ni crédit (ex. Coolibo seul)
+
+    /* 2) Retrouver le client Tiinda, du plus fiable au moins fiable :
+          tiinda_id transmis par le site > client Shopify déjà lié > email. */
+    const cli = await trouverClientCommande(order, email, shopCustId);
+    if (!cli) {
+      console.error('webhook: client introuvable', email, orderRef);
+      await signalerCommandeOrpheline(order, email, orderRef, lignesForfait, creditTotal);
+      return;
+    }
+    if (shopCustId && !cli.shopify_customer_id) {
+      await db.from('clients').update({ shopify_customer_id: shopCustId }).eq('id', cli.id);
+    }
+
+    /* 3) Forfait payé par carte : activation ou renouvellement d'un mois. */
+    if (lignesForfait.length) {
+      await activerForfaitCarte(cli, lignesForfait[0], order, orderRef);
+    }
+
+    /* 4) Crédit wallet (une seule fois par commande). */
+    if (creditTotal > 0) {
+      creditTotal = Math.round(creditTotal * 100) / 100;
+      const { error: errDup } = await db.from('recharges').insert({
+        client_id: cli.id, montant: creditTotal, moyen: 'carte',
+        code_recharge: 'CMD-' + (order.order_number || order.id || ''), statut: 'valide',
+        reference: orderRef + '-CREDIT'
+      });
+      if (errDup && String(errDup.code) === '23505') { console.log('webhook: crédit déjà traité', orderRef); return; }
+      if (errDup) { console.error('webhook recharge insert:', errDup.message); return; }
+      const { data: frais } = await db.from('clients').select('wallet_balance').eq('id', cli.id).maybeSingle();
+      const newBal = Number((frais && frais.wallet_balance) || 0) + creditTotal;
+      await db.from('clients').update({ wallet_balance: newBal }).eq('id', cli.id);
+      console.log('webhook: +' + creditTotal + ' € → ' + cli.tiinda_id + ' (solde ' + newBal + ')');
+    }
   } catch (err) {
     console.error('webhook order-paid error:', err.message);
   }
 });
+
+/* ── Aides du webhook « commande payée » ──────────────────────────────────── */
+
+// Reconnaît le forfait dans le titre / SKU d'une ligne de commande.
+function forfaitDepuisTexte(t) {
+  t = String(t || '').toLowerCase();
+  if (t.indexOf('mokili') >= 0) return 'MOKILI PRO';
+  if (t.indexOf('familia') >= 0) return 'FAMILIA';
+  if (t.indexOf('bokolo') >= 0) return 'BOKOLO';
+  return null;
+}
+
+// Lit un attribut transmis par le site (attribut de panier ou propriété de ligne).
+function attributCommande(order, nom) {
+  const cibles = [nom, '_' + nom];
+  const na = order.note_attributes || [];
+  for (const a of na) { if (a && cibles.indexOf(a.name) >= 0 && a.value) return String(a.value).trim(); }
+  for (const it of (order.line_items || [])) {
+    for (const p of (it.properties || [])) { if (p && cibles.indexOf(p.name) >= 0 && p.value) return String(p.value).trim(); }
+  }
+  return '';
+}
+
+const CHAMPS_CLIENT_WEBHOOK = 'id, tiinda_id, prenom, email, wallet_balance, offre, abonnement_fin, shopify_customer_id';
+
+async function trouverClientCommande(order, email, shopCustId) {
+  // a) identifiant Tiinda envoyé par le site au moment du paiement
+  const tid = attributCommande(order, 'tiinda_id').toUpperCase();
+  if (tid) {
+    const { data } = await db.from('clients').select(CHAMPS_CLIENT_WEBHOOK).eq('tiinda_id', tid).limit(1).maybeSingle();
+    if (data) return data;
+  }
+  // b) client Shopify déjà relié (indispensable pour les renouvellements mensuels)
+  if (shopCustId) {
+    const { data } = await db.from('clients').select(CHAMPS_CLIENT_WEBHOOK).eq('shopify_customer_id', shopCustId).limit(1).maybeSingle();
+    if (data) return data;
+  }
+  // c) email de la commande
+  if (email) {
+    const { data } = await db.from('clients').select(CHAMPS_CLIENT_WEBHOOK).ilike('email', email).limit(1).maybeSingle();
+    if (data) return data;
+  }
+  return null;
+}
+
+// Forfait payé par carte (abonnement Shopify) : +1 mois, facture, sans toucher au wallet.
+async function activerForfaitCarte(cli, ligne, order, orderRef) {
+  // Idempotence : une facture par commande Shopify.
+  const { data: deja } = await db.from('factures').select('id').eq('ref', orderRef).limit(1).maybeSingle();
+  if (deja) { console.log('webhook: forfait déjà traité', orderRef); return; }
+
+  const maintenant = new Date();
+  const finActuelle = cli.abonnement_fin ? new Date(cli.abonnement_fin) : null;
+  const memeOffre = String(cli.offre || '').toUpperCase() === ligne.offre;
+  // Renouvellement du même forfait encore actif : on prolonge depuis l'échéance.
+  const depart = (memeOffre && finActuelle && finActuelle > maintenant) ? finActuelle : maintenant;
+  const nouvelleFin = new Date(depart); nouvelleFin.setMonth(nouvelleFin.getMonth() + 1);
+
+  const maj = {
+    offre: ligne.offre,
+    abonnement_fin: nouvelleFin.toISOString(),
+    offre_suivante: null,
+    abonnement_carte: true,
+  };
+  if (!memeOffre || !finActuelle || finActuelle <= maintenant) maj.offre_debut = maintenant.toISOString();
+  const { error } = await db.from('clients').update(maj).eq('id', cli.id);
+  if (error) { console.error('webhook forfait update:', error.message); return; }
+
+  const recurrent = /recurring/i.test(String(order.tags || '')) || depart !== maintenant;
+  const libelle = (recurrent ? 'Renouvellement abonnement ' : 'Abonnement ') + ligne.offre + ' (carte bancaire)';
+  await emitInvoice(cli.id, libelle, ligne.prix, orderRef);
+  console.log('webhook: forfait ' + ligne.offre + ' → ' + cli.tiinda_id + ' jusqu\'au ' + nouvelleFin.toISOString().slice(0, 10));
+}
+
+// Commande payée sans client Tiinda reconnu : on la garde pour traitement manuel.
+async function signalerCommandeOrpheline(order, email, orderRef, lignesForfait, creditTotal) {
+  try {
+    await db.from('commandes_a_traiter').insert({
+      shopify_order: orderRef,
+      numero: String(order.order_number || order.name || ''),
+      email: email || null,
+      total: Number(order.total_price || 0),
+      contenu: lignesForfait.length ? ('Forfait ' + lignesForfait[0].offre) : ('Crédit ' + creditTotal + ' €'),
+      statut: 'a_traiter',
+    });
+  } catch (e) { console.error('orpheline insert:', e.message); }
+  const alerte = process.env.ADMIN_EMAIL;
+  if (alerte && RESEND_API_KEY) {
+    try {
+      await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: MAIL_FROM || 'Tiinda <onboarding@resend.dev>', to: alerte,
+          subject: 'Tiinda : commande payée sans client reconnu (' + (order.name || orderRef) + ')',
+          html: '<p>La commande <strong>' + (order.name || orderRef) + '</strong> ('
+            + Number(order.total_price || 0).toFixed(2) + ' €) a été payée avec l\'email <strong>'
+            + (email || 'inconnu') + '</strong>, qui ne correspond à aucun compte Tiinda.</p>'
+            + '<p>Elle est enregistrée dans la table <em>commandes_a_traiter</em>. '
+            + 'Rattachez-la au bon client ou remboursez-la.</p>'
+        })
+      });
+    } catch (e) { console.error('orpheline mail:', e.message); }
+  }
+}
 
 /* Génère « CLB-2026-7KPYIW » — année + 6 caractères base36. */
 function genTrackingCoolibo() {
@@ -2647,8 +2791,14 @@ app.post('/cron/rappels', async (req, res) => {
     if (error) { console.error('rappels rpc:', error.message);
       return res.json({ ok: false, error: 'rpc_failed' }); }
 
+    /* Les abonnés par carte sont prélevés automatiquement par Shopify :
+       pas de rappel « rechargez votre solde » pour eux. */
+    const { data: parCarte } = await db.from('clients').select('id').eq('abonnement_carte', true);
+    const idsCarte = new Set((parCarte || []).map(function (r) { return r.id; }));
+
     let envoyes = 0;
     for (const c of (liste || [])) {
+      if (idsCarte.has(c.client_id)) continue;
       const fin = new Date(c.abonnement_fin);
       const finFr = fin.toLocaleDateString('fr-FR');
       const manque = Math.round((Number(c.prix_requis) - Number(c.wallet_balance)) * 100) / 100;
