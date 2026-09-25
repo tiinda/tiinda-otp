@@ -207,6 +207,23 @@ async function activerForfaitCarte(cli, ligne, order, orderRef) {
   const libelle = (recurrent ? 'Renouvellement abonnement ' : 'Abonnement ') + ligne.offre + ' (carte bancaire)';
   await emitInvoice(cli.id, libelle, ligne.prix, orderRef);
   console.log('webhook: forfait ' + ligne.offre + ' → ' + cli.tiinda_id + ' jusqu\'au ' + nouvelleFin.toISOString().slice(0, 10));
+
+  /* L'abonnement payé par carte est reversé sur le solde Tiinda (montant exact payé,
+     sans bonus), à chaque paiement : premier mois et renouvellements. */
+  const montant = Math.round(Number(ligne.prix || 0) * 100) / 100;
+  if (montant > 0) {
+    const { error: errCred } = await db.from('recharges').insert({
+      client_id: cli.id, montant: montant, moyen: 'abonnement', statut: 'valide',
+      code_recharge: 'CMD-' + (order.order_number || order.id || ''),
+      reference: orderRef + '-ABO'
+    });
+    if (errCred && String(errCred.code) === '23505') { console.log('webhook: crédit abonnement déjà versé', orderRef); return; }
+    if (errCred) { console.error('webhook crédit abonnement:', errCred.message); return; }
+    const { data: frais } = await db.from('clients').select('wallet_balance').eq('id', cli.id).maybeSingle();
+    const newBal = Math.round((Number((frais && frais.wallet_balance) || 0) + montant) * 100) / 100;
+    await db.from('clients').update({ wallet_balance: newBal }).eq('id', cli.id);
+    console.log('webhook: abonnement +' + montant + ' € sur le solde → ' + cli.tiinda_id + ' (solde ' + newBal + ')');
+  }
 }
 
 // Commande payée sans client Tiinda reconnu : on la garde pour traitement manuel.
