@@ -364,7 +364,7 @@ app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (originAllowed(origin)) { res.header('Access-Control-Allow-Origin', origin); res.header('Vary', 'Origin'); }
   res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-token, x-scan-token');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-token, x-admin-session, x-scan-token');
   res.header('Access-Control-Max-Age', '86400');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -1517,21 +1517,98 @@ app.post('/visite', async (req, res) => {
 /* ── 10) PANNEAU ADMIN (équipe Tiinda) ─────────────────────────────────────
    Protégé par ADMIN_TOKEN — transmis UNIQUEMENT via le header x-admin-token
    (plus jamais dans l'URL, pour ne pas fuiter dans les logs/historique). */
-function requireAdmin(req, res, next) {
-  const token = req.headers['x-admin-token'];
-  if (!ADMIN_TOKEN || !token) return res.status(401).json({ ok: false, error: 'unauthorized' });
-  const a = Buffer.from(String(token));
-  const b = Buffer.from(String(ADMIN_TOKEN));
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ ok: false, error: 'unauthorized' });
-  next();
+/* ── Double authentification admin (mot de passe + Google Authenticator) ──
+   - ADMIN_TOKEN        : mot de passe admin (variable Render)
+   - ADMIN_TOTP_SECRET  : clé Google Authenticator (base32, variable Render)
+   Tant que ADMIN_TOTP_SECRET n'est pas renseignée, le mot de passe seul suffit
+   (transition). Dès qu'elle l'est, le code à 6 chiffres devient obligatoire et
+   l'ancien en-tête x-admin-token n'ouvre plus l'admin. */
+const ADMIN_SESSION_TTL_MS = 12 * 3600000; // 12 heures
+function totpActif() { return !!(process.env.ADMIN_TOTP_SECRET || '').trim(); }
+function base32Decode(str) {
+  const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const clean = String(str || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
+  let bits = 0, val = 0; const out = [];
+  for (const ch of clean) { val = (val << 5) | A.indexOf(ch); bits += 5; if (bits >= 8) { out.push((val >>> (bits - 8)) & 255); bits -= 8; } }
+  return Buffer.from(out);
+}
+function totpCode(key, counter) {
+  const buf = Buffer.alloc(8); buf.writeBigUInt64BE(BigInt(counter));
+  const h = crypto.createHmac('sha1', key).update(buf).digest();
+  const o = h[h.length - 1] & 15;
+  const n = ((h[o] & 127) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3];
+  return String(n % 1000000).padStart(6, '0');
+}
+let dernierCompteurTotp = 0; // anti-rejeu : un code ne sert qu'une fois
+function verifTotp(code) {
+  const c = String(code || '').replace(/\D/g, '');
+  if (c.length !== 6) return false;
+  const key = base32Decode(process.env.ADMIN_TOTP_SECRET);
+  const now = Math.floor(Date.now() / 30000);
+  for (let d = -1; d <= 1; d++) {
+    const ctr = now + d;
+    const a = Buffer.from(totpCode(key, ctr)), b = Buffer.from(c);
+    if (crypto.timingSafeEqual(a, b)) {
+      if (ctr <= dernierCompteurTotp) return false;
+      dernierCompteurTotp = ctr; return true;
+    }
+  }
+  return false;
+}
+function egalSur(x, y) {
+  const a = Buffer.from(String(x || '')), b = Buffer.from(String(y || ''));
+  return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
+}
+function signAdmin() {
+  const payload = b64url(JSON.stringify({ a: 1, exp: Date.now() + ADMIN_SESSION_TTL_MS }));
+  const sig = b64url(crypto.createHmac('sha256', SESSION_KEY).update('admin:' + payload).digest());
+  return payload + '.' + sig;
+}
+function verifAdminSession(tok) {
+  if (!tok || typeof tok !== 'string' || tok.indexOf('.') < 0) return false;
+  const parts = tok.split('.');
+  const expected = b64url(crypto.createHmac('sha256', SESSION_KEY).update('admin:' + parts[0]).digest());
+  if (!egalSur(parts[1], expected)) return false;
+  let d; try { d = JSON.parse(Buffer.from(parts[0].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString()); } catch (e) { return false; }
+  return !!(d && d.a === 1 && d.exp && Date.now() < d.exp);
 }
 
-// Accès "scan entrepôt" : accepte le token ADMIN **ou** un SCAN_TOKEN dédié,
-// pour pouvoir déléguer le scan à l'équipe sans donner l'accès admin complet.
+// Connexion admin : mot de passe + code Google Authenticator → session 12 h.
+app.post('/admin/login', (req, res) => {
+  const ip = clientIp(req);
+  if (!rateLimit('admin-login:' + ip, 5, 15 * 60000)) {
+    return res.status(429).json({ ok: false, error: 'trop_de_tentatives', message: 'Trop de tentatives. Réessayez dans 15 minutes.' });
+  }
+  const b = req.body || {};
+  if (!ADMIN_TOKEN || !egalSur(b.password, ADMIN_TOKEN)) {
+    console.warn('admin login: mot de passe refusé', ip);
+    return res.status(401).json({ ok: false, error: 'identifiants' });
+  }
+  if (totpActif()) {
+    if (!b.code) return res.json({ ok: false, error: 'code_requis' });
+    if (!verifTotp(b.code)) {
+      console.warn('admin login: code 2FA refusé', ip);
+      return res.status(401).json({ ok: false, error: 'code_invalide' });
+    }
+  }
+  console.log('admin login: OK', ip, totpActif() ? '(2FA)' : '(sans 2FA)');
+  res.json({ ok: true, session: signAdmin(), expire_dans_h: 12, deux_facteurs: totpActif() });
+});
+
+function requireAdmin(req, res, next) {
+  if (verifAdminSession(req.headers['x-admin-session'])) return next();
+  // Ancien mode (mot de passe seul) accepté uniquement tant que la 2FA n'est pas activée.
+  if (!totpActif() && ADMIN_TOKEN && egalSur(req.headers['x-admin-token'], ADMIN_TOKEN)) return next();
+  return res.status(401).json({ ok: false, error: 'unauthorized' });
+}
+
+// Accès "scan entrepôt" : SCAN_TOKEN dédié (PDA / équipe) ou session admin.
+// Le mot de passe admin seul n'est plus accepté une fois la 2FA activée.
 function requireScan(req, res, next) {
   const token = req.headers['x-scan-token'] || req.headers['x-admin-token'];
-  const ok = function (ref) { if (!ref || !token) return false; const a = Buffer.from(String(token)), b = Buffer.from(String(ref)); return a.length === b.length && crypto.timingSafeEqual(a, b); };
-  if (ok(process.env.SCAN_TOKEN) || ok(ADMIN_TOKEN)) return next();
+  if (process.env.SCAN_TOKEN && egalSur(token, process.env.SCAN_TOKEN)) return next();
+  if (verifAdminSession(req.headers['x-admin-session'])) return next();
+  if (!totpActif() && ADMIN_TOKEN && egalSur(token, ADMIN_TOKEN)) return next();
   return res.status(401).json({ ok: false, error: 'unauthorized' });
 }
 
