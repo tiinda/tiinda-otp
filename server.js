@@ -693,6 +693,19 @@ app.post('/send', verifyShopifyProxy, async (req, res) => {
 });
 
 /* ── 5) Route : vérification du code + création du client dans Supabase ──── */
+/* Vérification publique d'un code promo influenceur (pour l'icône ✓ / ✗ à l'inscription). */
+app.get('/promo/check', async (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  try {
+    const code = String(req.query.code || '').trim().toUpperCase();
+    if (!/^[A-Z0-9_-]{3,30}$/.test(code)) return res.json({ valid: false });
+    const { data } = await db.from('influenceurs').select('code, reduction_pct')
+      .eq('code', code).eq('actif', true).limit(1).maybeSingle();
+    if (!data) return res.json({ valid: false });
+    return res.json({ valid: true, reduction_pct: data.reduction_pct });
+  } catch (e) { return res.json({ valid: false }); }
+});
+
 app.post('/verify', verifyShopifyProxy, async (req, res) => {
   try {
     if (!rateLimit('verify:' + clientIp(req), 20, 600000)) return res.status(429).json({ ok: false, error: 'too_many_requests' });
