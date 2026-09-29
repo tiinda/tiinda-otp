@@ -2866,7 +2866,7 @@ app.post('/admin/influenceurs/save', requireAdmin, async (req, res) => {
     const code = String(b.code || '').trim().toUpperCase();
     if (!/^[A-Z0-9_-]{3,30}$/.test(code)) return res.json({ ok: false, error: 'Code invalide (3 à 30 lettres/chiffres, sans espace).' });
     if (!String(b.nom || '').trim()) return res.json({ ok: false, error: 'Nom obligatoire.' });
-    if (b.ville && ['Brazzaville', 'Pointe-Noire'].indexOf(b.ville) < 0) return res.json({ ok: false, error: 'Ville invalide.' });
+    if (b.ville && ['Brazzaville', 'Pointe-Noire', 'Dolisie'].indexOf(b.ville) < 0) return res.json({ ok: false, error: 'Ville invalide.' });
     const pct = parseInt(b.reduction_pct, 10);
     if (!(pct >= 0 && pct <= 100)) return res.json({ ok: false, error: 'Réduction entre 0 et 100 %.' });
     const com = parseInt(b.commission_fcfa, 10);
