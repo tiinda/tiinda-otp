@@ -2837,6 +2837,76 @@ app.post('/admin/points-relais/delete', requireAdmin, async (req, res) => {
   } catch (e) { res.status(500).json({ ok: false }); }
 });
 
+// (ADMIN) Influenceurs : liste + stats en direct depuis Supabase.
+app.get('/admin/influenceurs', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const { data: infs, error } = await db.from('influenceurs').select('*').order('created_at', { ascending: false });
+    if (error) return res.json({ ok: false, error: error.message });
+    const { data: stats } = await db.from('stats_influenceurs').select('*');
+    const byCode = {}; (stats || []).forEach(function (s) { byCode[s.code] = s; });
+    const list = (infs || []).map(function (i) {
+      const st = byCode[i.code] || {};
+      return Object.assign({}, i, {
+        inscrits: Number(st.inscrits || 0),
+        premiers_envois: Number(st.premiers_envois || 0),
+        commission_due_fcfa: Number(st.commission_due_fcfa || 0),
+        ca_genere: Number(st.ca_genere || 0),
+      });
+    });
+    res.json({ ok: true, influenceurs: list });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+
+// (ADMIN) Créer ou modifier un influenceur. Le code est unique (clé primaire) : pas de doublon possible.
+app.post('/admin/influenceurs/save', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const b = req.body || {};
+    const code = String(b.code || '').trim().toUpperCase();
+    if (!/^[A-Z0-9_-]{3,30}$/.test(code)) return res.json({ ok: false, error: 'Code invalide (3 à 30 lettres/chiffres, sans espace).' });
+    if (!String(b.nom || '').trim()) return res.json({ ok: false, error: 'Nom obligatoire.' });
+    if (b.ville && ['Brazzaville', 'Pointe-Noire'].indexOf(b.ville) < 0) return res.json({ ok: false, error: 'Ville invalide.' });
+    const pct = parseInt(b.reduction_pct, 10);
+    if (!(pct >= 0 && pct <= 100)) return res.json({ ok: false, error: 'Réduction entre 0 et 100 %.' });
+    const com = parseInt(b.commission_fcfa, 10);
+    const row = {
+      code: code, nom: String(b.nom).trim(), ville: b.ville || null,
+      telephone: b.telephone ? String(b.telephone).trim() : null,
+      reduction_pct: pct, commission_fcfa: com >= 0 ? com : 0,
+      actif: b.actif === false || b.actif === 'false' ? false : true,
+    };
+    const ancien = b.ancien_code ? String(b.ancien_code).trim().toUpperCase() : null;
+    let r;
+    if (ancien) {
+      if (ancien !== code) {
+        const { count } = await db.from('clients').select('id', { count: 'exact', head: true }).eq('code_influenceur', ancien);
+        if (count > 0) return res.json({ ok: false, error: 'Ce code est déjà utilisé par ' + count + ' client(s) : impossible de le renommer. Désactivez-le et créez-en un nouveau.' });
+      }
+      r = await db.from('influenceurs').update(row).eq('code', ancien).select().single();
+    } else {
+      const { data: ex } = await db.from('influenceurs').select('code').eq('code', code).maybeSingle();
+      if (ex) return res.json({ ok: false, error: 'Ce code existe déjà.' });
+      r = await db.from('influenceurs').insert(row).select().single();
+    }
+    if (r.error) return res.json({ ok: false, error: r.error.message });
+    res.json({ ok: true, influenceur: r.data });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+
+// (ADMIN) Activer / désactiver un code (on ne supprime jamais : l'historique reste juste).
+app.post('/admin/influenceurs/toggle', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const code = String(req.body.code || '').trim().toUpperCase();
+    const { data: cur } = await db.from('influenceurs').select('actif').eq('code', code).maybeSingle();
+    if (!cur) return res.json({ ok: false, error: 'Code introuvable.' });
+    const { error } = await db.from('influenceurs').update({ actif: !cur.actif }).eq('code', code);
+    if (error) return res.json({ ok: false, error: error.message });
+    res.json({ ok: true, actif: !cur.actif });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+
 // (ADMIN) Supervision du parrainage : qui a parrainé qui + récompenses versées.
 app.get('/admin/referrals', requireAdmin, async (req, res) => {
   try {
