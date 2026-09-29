@@ -546,7 +546,9 @@ async function getOrCreateClient(phone, info = {}) {
     email:  info.email ? String(info.email).trim().toLowerCase() : null,
     phone,
     ville:  info.ville || null,
-    offre:  info.offre || null,
+    // Forfait payant : activé UNIQUEMENT après paiement (webhook Shopify « commande payée »).
+    // À l'inscription, tout nouveau compte démarre en Découverte.
+    offre:  'Découverte',
   };
   // Mot de passe (pour la connexion email + mot de passe).
   if (info.password) insert.password_hash = hashPassword(info.password);
@@ -555,6 +557,12 @@ async function getOrCreateClient(phone, info = {}) {
     const refCode = String(info.ref).trim().toUpperCase();
     const { data: parrain } = await db.from('clients').select('id').eq('tiinda_id', refCode).limit(1).maybeSingle();
     if (parrain) insert.parrain_id = parrain.id;
+  }
+  // Influenceur : code promo saisi à l'inscription (vérifié en base par le trigger Supabase).
+  if (info.code_influenceur) {
+    const codeInf = String(info.code_influenceur).trim().toUpperCase();
+    const { data: inf } = await db.from('influenceurs').select('code').eq('code', codeInf).eq('actif', true).limit(1).maybeSingle();
+    if (inf) insert.code_influenceur = inf.code;
   }
   const { data: created, error } = await db.from('clients').insert(insert).select().single();
   if (error) { console.error('create client error:', error.message); return null; }
@@ -709,6 +717,7 @@ app.post('/verify', verifyShopifyProxy, async (req, res) => {
       offre:  req.body.offre,
       password: req.body.password,
       ref: req.body.ref,
+      code_influenceur: req.body.code_influenceur,
     });
 
     res.json({
