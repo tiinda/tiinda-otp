@@ -790,8 +790,8 @@ app.post('/password/forgot', async (req, res) => {
       const { data: cli } = await db.from('clients').select('id, prenom, email').ilike('email', email).limit(1).maybeSingle();
       if (cli && cli.email && RESEND_API_KEY) {
         const tokenR = signReset(cli.email);
-        const base = (process.env.SITE_URL || 'https://tiinda.com');
-        const link = base + '/pages/reinitialiser-mot-de-passe?token=' + encodeURIComponent(tokenR);
+        // Page servie directement par ce serveur (aucune page Shopify à créer).
+        const link = 'https://tiinda-otp.onrender.com/reinitialiser-mot-de-passe?token=' + encodeURIComponent(tokenR);
         const html =
           '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:auto;color:#1a1a1a">' +
             '<div style="background:#0057FF;color:#fff;padding:20px;border-radius:12px 12px 0 0;text-align:center">' +
@@ -820,6 +820,14 @@ app.post('/password/forgot', async (req, res) => {
 });
 
 /* ── Réinitialisation effective : token (du lien email) + nouveau mot de passe */
+/* Page « Nouveau mot de passe » servie par le serveur (lien de l'email). */
+const RESET_PAGE_HTML = "<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Nouveau mot de passe · Tiinda</title>\n<style>body{margin:0;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,sans-serif;background:#F4F7FB;color:#0B1226;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box}.box{background:#fff;border:1px solid #E6E8EF;border-radius:18px;padding:32px 28px;max-width:420px;width:100%;box-sizing:border-box}h1{font-size:24px;margin:0 0 6px}p{color:#6B7390;font-size:14px;margin:0 0 22px;line-height:1.5}label{display:block;font-size:14px;font-weight:600;margin:0 0 6px}input{width:100%;box-sizing:border-box;height:48px;border:1px solid #E4E7EE;border-radius:11px;padding:0 14px;font-size:15px;margin-bottom:14px;font-family:inherit}button{width:100%;height:50px;border:0;border-radius:12px;background:#0057FF;color:#fff;font-weight:700;font-size:15px;cursor:pointer}button:disabled{opacity:.6}.msg{display:none;margin-top:14px;padding:11px 14px;border-radius:10px;font-size:14px}a{color:#0057FF}</style></head>\n<body><div class=\"box\"><img src=\"https://cdn.shopify.com/s/files/1/0989/4694/1310/files/tiinda-logo_8c7fc543-89c5-4cba-a8fc-0e9b095c0f60.png?v=1790661597\" alt=\"Tiinda\" height=\"40\" style=\"display:block;margin-bottom:22px\">\n<h1>Nouveau mot de passe</h1><p>Choisissez un nouveau mot de passe (8 caractères minimum).</p>\n<label for=\"pw1\">Nouveau mot de passe</label><input id=\"pw1\" type=\"password\" autocomplete=\"new-password\">\n<label for=\"pw2\">Confirmer le mot de passe</label><input id=\"pw2\" type=\"password\" autocomplete=\"new-password\">\n<button id=\"go\">Enregistrer</button><div id=\"msg\" class=\"msg\"></div></div>\n<script>(function(){var $=function(i){return document.getElementById(i);};var token=new URLSearchParams(location.search).get('token')||'';\nfunction show(t,ok){var m=$('msg');m.innerHTML=t;m.style.display='block';m.style.background=ok?'#E9F7EF':'#FFF1F1';m.style.color=ok?'#0F7A42':'#C0392B';}\nif(!token){show('Lien invalide. <a href=\"https://tiinda.com/#page-login\">Refaire une demande</a>.',false);$('go').disabled=true;}\n$('go').addEventListener('click',function(){var a=$('pw1').value,b=$('pw2').value;\nif(a.length<8)return show('8 caractères minimum.',false);if(a!==b)return show('Les deux mots de passe ne sont pas identiques.',false);\nvar btn=$('go');btn.disabled=true;show('Enregistrement…',true);\nfetch('/password/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token,password:a})})\n.then(function(r){return r.json();}).then(function(d){\nif(d&&d.ok){show('✓ Mot de passe modifié. Redirection vers la connexion…',true);setTimeout(function(){location.href='https://tiinda.com/#page-login';},1800);return;}\nvar e=d&&d.error;show(e==='lien_invalide'?'Ce lien a expiré. <a href=\"https://tiinda.com/#page-login\">Refaire une demande</a>.':e==='too_many_requests'?'Trop d’essais. Réessayez dans 10 minutes.':e==='compte_introuvable'?'Compte introuvable.':'Échec. Réessayez.',false);btn.disabled=false;})\n.catch(function(){show('Connexion impossible.',false);btn.disabled=false;});});\n$('pw2').addEventListener('keydown',function(e){if(e.key==='Enter')$('go').click();});})();</script></body></html>";
+app.get('/reinitialiser-mot-de-passe', (req, res) => {
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.set('Cache-Control', 'no-store');
+  res.send(RESET_PAGE_HTML);
+});
+
 app.post('/password/reset', async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
@@ -2904,6 +2912,25 @@ app.post('/admin/influenceurs/toggle', requireAdmin, async (req, res) => {
     const { error } = await db.from('influenceurs').update({ actif: !cur.actif }).eq('code', code);
     if (error) return res.json({ ok: false, error: error.message });
     res.json({ ok: true, actif: !cur.actif });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+
+// (ADMIN) Supprimer un influenceur. Si des clients utilisent son code, il faut confirmer (force) :
+// les clients sont alors détachés (ils gardent leur compte, sans code influenceur).
+app.post('/admin/influenceurs/delete', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    const code = String(req.body.code || '').trim().toUpperCase();
+    if (!code) return res.json({ ok: false, error: 'Code manquant.' });
+    const { count } = await db.from('clients').select('id', { count: 'exact', head: true }).eq('code_influenceur', code);
+    if (count > 0 && !req.body.force) return res.json({ ok: false, needForce: true, clients: count });
+    if (count > 0) {
+      const u = await db.from('clients').update({ code_influenceur: null }).eq('code_influenceur', code);
+      if (u.error) return res.json({ ok: false, error: u.error.message });
+    }
+    const { error } = await db.from('influenceurs').delete().eq('code', code);
+    if (error) return res.json({ ok: false, error: error.message });
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ ok: false }); }
 });
 
