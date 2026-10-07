@@ -1,5 +1,5 @@
 /* ─────────────────────────────────────────────────────────────────────────
-   TIINDA — Backend (Twilio Verify + Supabase)
+   TIINDA, Backend (Twilio Verify + Supabase)
    ─────────────────────────────────────────────────────────────────────────
    Rôle :
      1) Vérifier les numéros par WhatsApp/SMS (Twilio Verify).
@@ -16,7 +16,7 @@
      GET  /health                                            → { ok: true }
 
    ⚠️  Clés secrètes (Twilio + Supabase) UNIQUEMENT dans les variables
-       d'environnement de ce serveur — jamais dans le thème Shopify.
+       d'environnement de ce serveur, jamais dans le thème Shopify.
    ───────────────────────────────────────────────────────────────────────── */
 
 const express = require('express');
@@ -31,9 +31,9 @@ const {
   SHOPIFY_API_SECRET,          // "API secret key" de ton app Shopify (signe le proxy)
   SUPABASE_URL,                // https://xxxx.supabase.co
   SUPABASE_SERVICE_KEY,        // clé secrète Supabase (sb_secret_...)
-  RESEND_API_KEY,              // clé API Resend (envoi d'emails) — optionnel
+  RESEND_API_KEY,              // clé API Resend (envoi d'emails), optionnel
   MAIL_FROM,                   // expéditeur, ex: "Tiinda <noreply@tiinda.com>"
-  TRACK123_API_KEY,            // clé API Track123 (suivi colis) — optionnel
+  TRACK123_API_KEY,            // clé API Track123 (suivi colis), optionnel
   ADMIN_TOKEN,                 // mot de passe du panneau Admin Tiinda
   SESSION_SECRET,              // secret pour signer les tokens de session client
   ALLOWED_ORIGINS,             // domaines autorisés (CORS), séparés par des virgules
@@ -42,14 +42,24 @@ const {
 
 const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-// Connexion Supabase (uniquement si les clés sont présentes — évite un crash).
+/* Expéditeurs des emails (domaine tiinda.com validé dans Resend).
+   MAIL_FROM / MAIL_FROM_COOLIBO sur Render prennent le dessus si renseignées. */
+const EXPEDITEUR = MAIL_FROM || 'Tiinda <noreply@tiinda.com>';
+const EXPEDITEUR_COOLIBO = process.env.MAIL_FROM_COOLIBO || 'Coolibo <noreply@tiinda.com>';
+
+/* Adresse publique de ce serveur, utilisée dans les liens envoyés par email.
+   Mettre API_URL=https://api.tiinda.com sur Render une fois le sous-domaine
+   branché : un lien vers tiinda.com rassure Hotmail/Outlook (anti-phishing). */
+const API_BASE = (process.env.API_URL || 'https://tiinda-otp.onrender.com').replace(/\/$/, '');
+
+// Connexion Supabase (uniquement si les clés sont présentes, évite un crash).
 const db = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
   : null;
 
 const app = express();
 
-/* ── Webhook Shopify « commande payée » — crédit automatique du wallet ──────
+/* ── Webhook Shopify « commande payée », crédit automatique du wallet ──────
    Doit lire le corps BRUT (avant express.json) pour vérifier la signature HMAC.
    Bonus : +5% sur 20 €, +10% sur 50 €. ───────────────────────────────────── */
 const CREDIT_BONUS = { 10: 0, 20: 0.05, 50: 0.10 };
@@ -253,7 +263,7 @@ async function signalerCommandeOrpheline(order, email, orderRef, lignesForfait, 
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          from: MAIL_FROM || 'Tiinda <onboarding@resend.dev>', to: alerte,
+          from: EXPEDITEUR, to: alerte,
           subject: 'Tiinda : commande payée sans client reconnu (' + (order.name || orderRef) + ')',
           html: '<p>La commande <strong>' + (order.name || orderRef) + '</strong> ('
             + Number(order.total_price || 0).toFixed(2) + ' €) a été payée avec l\'email <strong>'
@@ -266,7 +276,7 @@ async function signalerCommandeOrpheline(order, email, orderRef, lignesForfait, 
   }
 }
 
-/* Génère « CLB-2026-7KPYIW » — année + 6 caractères base36. */
+/* Génère « CLB-2026-7KPYIW », année + 6 caractères base36. */
 function genTrackingCoolibo() {
   const y = new Date().getFullYear();
   let r = '';
@@ -347,7 +357,7 @@ async function coolliboDepuisCommande(order) {
 app.use(express.json());
 app.set('trust proxy', true);
 
-/* ── 0) CORS — restreint aux domaines Tiinda (plus de '*' ouvert à tous) ─────
+/* ── 0) CORS, restreint aux domaines Tiinda (plus de '*' ouvert à tous) ─────
    On autorise : la liste ALLOWED_ORIGINS (env), tiinda.com / www.tiinda.com par
    défaut, et tout sous-domaine *.myshopify.com (preview/boutique Shopify).
    Le token de session reste la vraie barrière d'authentification ; le CORS
@@ -372,7 +382,7 @@ app.use((req, res, next) => {
 
 /* ── 0b) TOKENS DE SESSION CLIENT (HMAC, sans librairie externe) ────────────
    Après un OTP valide, on émet un token signé contenant le téléphone + une
-   expiration. Les routes client en déduisent le téléphone — on ne fait JAMAIS
+   expiration. Les routes client en déduisent le téléphone, on ne fait JAMAIS
    confiance à un ?phone= brut. */
 const SESSION_KEY = SESSION_SECRET
   || (SUPABASE_SERVICE_KEY ? crypto.createHash('sha256').update('tiinda::' + SUPABASE_SERVICE_KEY).digest('hex') : 'dev-secret-change-me');
@@ -791,7 +801,7 @@ app.post('/password/forgot', async (req, res) => {
       if (cli && cli.email && RESEND_API_KEY) {
         const tokenR = signReset(cli.email);
         // Page servie directement par ce serveur (aucune page Shopify à créer).
-        const link = 'https://tiinda-otp.onrender.com/reinitialiser-mot-de-passe?token=' + encodeURIComponent(tokenR);
+        const link = API_BASE + '/reinitialiser-mot-de-passe?token=' + encodeURIComponent(tokenR);
         const html =
           '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:auto;color:#1a1a1a">' +
             '<div style="background:#0057FF;color:#fff;padding:20px;border-radius:12px 12px 0 0;text-align:center">' +
@@ -804,11 +814,12 @@ app.post('/password/forgot', async (req, res) => {
               '<p style="font-size:12px;color:#999;word-break:break-all">Ou copiez ce lien : ' + link + '</p>' +
             '</div></div>';
         try {
-          await fetch('https://api.resend.com/emails', {
+          const r = await fetch('https://api.resend.com/emails', {
             method: 'POST',
             headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ from: MAIL_FROM || 'Tiinda <onboarding@resend.dev>', to: cli.email, subject: 'Tiinda — Réinitialisation de votre mot de passe', html }),
+            body: JSON.stringify({ from: EXPEDITEUR, to: cli.email, subject: 'Tiinda : réinitialisation de votre mot de passe', html }),
           });
+          if (!r.ok) console.error('forgot mail refusé:', r.status, await r.text());
         } catch (e) { console.error('forgot mail error:', e.message); }
       }
     }
@@ -856,11 +867,12 @@ app.post('/password/reset', async (req, res) => {
             '<p style="margin-top:18px">L\u2019équipe Tiinda</p>' +
           '</div></div>';
       try {
-        await fetch('https://api.resend.com/emails', {
+        const r = await fetch('https://api.resend.com/emails', {
           method: 'POST',
           headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ from: MAIL_FROM || 'Tiinda <onboarding@resend.dev>', to: cli.email, subject: 'Tiinda — Votre mot de passe a été modifié ✓', html }),
+          body: JSON.stringify({ from: EXPEDITEUR, to: cli.email, subject: 'Tiinda : votre mot de passe a été modifié', html }),
         });
+        if (!r.ok) console.error('reset confirm mail refusé:', r.status, await r.text());
       } catch (e) { console.error('reset confirm mail error:', e.message); }
     }
     res.json({ ok: true });
@@ -896,7 +908,7 @@ app.get('/client', requireAuth, async (req, res) => {
    pas défini, la fonction ne fait rien (pas d'erreur). ───────────────────── */
 async function sendDeclarationEmail(client, colis) {
   if (!RESEND_API_KEY || !client || !client.email) return;
-  const from = MAIL_FROM || 'Tiinda <onboarding@resend.dev>';
+  const from = EXPEDITEUR;
   const prenom = client.prenom || 'cher client';
   const euro = colis.valeur != null ? (' (' + colis.valeur + ' €)') : '';
   const html =
@@ -909,25 +921,25 @@ async function sendDeclarationEmail(client, colis) {
         '<p>Votre colis a bien été enregistré. Voici le récapitulatif :</p>' +
         '<table style="width:100%;border-collapse:collapse;font-size:14px;margin:14px 0">' +
           '<tr><td style="padding:8px 0;color:#666">N° de suivi Tiinda</td><td style="padding:8px 0;font-weight:bold;text-align:right;color:#0057FF">' + colis.tracking_interne + '</td></tr>' +
-          '<tr><td style="padding:8px 0;color:#666">Suivi transporteur</td><td style="padding:8px 0;text-align:right">' + (colis.tracking_externe || '—') + '</td></tr>' +
-          '<tr><td style="padding:8px 0;color:#666">Description</td><td style="padding:8px 0;text-align:right">' + (colis.description || '—') + '</td></tr>' +
-          '<tr><td style="padding:8px 0;color:#666">Site marchand</td><td style="padding:8px 0;text-align:right">' + (colis.site_marchand || '—') + '</td></tr>' +
-          '<tr><td style="padding:8px 0;color:#666">Valeur déclarée</td><td style="padding:8px 0;text-align:right">' + (colis.valeur != null ? colis.valeur + ' €' : '—') + '</td></tr>' +
+          '<tr><td style="padding:8px 0;color:#666">Suivi transporteur</td><td style="padding:8px 0;text-align:right">' + (colis.tracking_externe || '-') + '</td></tr>' +
+          '<tr><td style="padding:8px 0;color:#666">Description</td><td style="padding:8px 0;text-align:right">' + (colis.description || '-') + '</td></tr>' +
+          '<tr><td style="padding:8px 0;color:#666">Site marchand</td><td style="padding:8px 0;text-align:right">' + (colis.site_marchand || '-') + '</td></tr>' +
+          '<tr><td style="padding:8px 0;color:#666">Valeur déclarée</td><td style="padding:8px 0;text-align:right">' + (colis.valeur != null ? colis.valeur + ' €' : '-') + '</td></tr>' +
         '</table>' +
         '<div style="text-align:center;background:#F5F8FF;border:1px solid #E1EAFF;border-radius:12px;padding:18px;margin:18px 0">' +
           '<img src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=0&data=' + encodeURIComponent(colis.tracking_interne) + '" alt="QR de retrait" width="160" height="160" style="background:#fff;border-radius:10px;padding:8px" />' +
-          '<div style="font-size:13px;color:#444;margin-top:10px"><strong>QR de retrait</strong> — présentez-le pour récupérer votre colis dans un casier ou point relais Tiinda au Congo.</div>' +
+          '<div style="font-size:13px;color:#444;margin-top:10px"><strong>QR de retrait</strong> : présentez-le pour récupérer votre colis dans un casier ou point relais Tiinda au Congo.</div>' +
         '</div>' +
         '<p style="font-size:13px;color:#666">Vous serez notifié sur WhatsApp dès la réception de votre colis à notre entrepôt. Conservez votre numéro de suivi Tiinda pour le retrait au Congo.</p>' +
         '<p style="margin-top:18px">L’équipe Tiinda</p>' +
       '</div>' +
-      '<div style="text-align:center;color:#999;font-size:11px;padding:14px">Tiinda — une marque de Colispo · France · Congo-Brazzaville &amp; RDC</div>' +
+      '<div style="text-align:center;color:#999;font-size:11px;padding:14px">Tiinda, une marque de Colispo · France · Congo-Brazzaville &amp; RDC</div>' +
     '</div>';
   try {
     const r = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from, to: client.email, subject: 'Tiinda — Colis déclaré (' + colis.tracking_interne + ')' + euro, html }),
+      body: JSON.stringify({ from, to: client.email, subject: 'Tiinda : colis déclaré (' + colis.tracking_interne + ')' + euro, html }),
     });
     if (!r.ok) console.error('email error:', r.status, await r.text());
   } catch (e) { console.error('email send error:', e.message); }
@@ -1096,7 +1108,7 @@ app.post('/forfait/change-wallet', requireAuth, async (req, res) => {
   }
 });
 
-// Demande d'expédition (individuelle ou regroupée) — débite le wallet et notifie l'équipe.
+// Demande d'expédition (individuelle ou regroupée), débite le wallet et notifie l'équipe.
 app.post('/colis/expedier', requireAuth, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
@@ -1310,7 +1322,7 @@ app.get('/exists', async (req, res) => {
   }
 });
 
-/* ── Assistant Tiinda (Claude / Anthropic) — clé secrète côté serveur ───────
+/* ── Assistant Tiinda (Claude / Anthropic), clé secrète côté serveur ───────
    Répond aux questions clients sur le service. Renvoie aussi escalate=true
    quand il vaut mieux passer à un conseiller humain (WhatsApp). */
 const TIINDA_SYSTEM = "Tu es l'assistant virtuel de Tiinda, un service qui donne aux clients une adresse en France pour recevoir leurs achats en ligne (Amazon, Shein, Zara...), puis expédie les colis au Congo-Brazzaville et en RDC. Réponds en français, ton chaleureux et concis. Infos clés : tarif expédition vers le Congo = 15 EUR/kg (poids facturé = le plus élevé entre poids réel et poids volumétrique, 1 kg = 6,26 L). Le client déclare son colis avec le numéro de suivi du transporteur, reçoit un numéro de suivi Tiinda (TND...). Étapes : Reçu en France -> Expédié vers Congo -> Arrivé au Congo -> Disponible au retrait -> Retiré. Le client recharge son solde Tiinda (carte, PayPal ou code de recharge) pour payer les expéditions. Regroupement de plusieurs colis = -10%. Points relais selon la ville. Ne JAMAIS inventer d'infos (numéros de commande, soldes, statuts précis). Si la question concerne un litige, un remboursement, un problème de paiement, un colis perdu, ou que tu n'es pas sûr, invite poliment le client à contacter un conseiller humain.";
@@ -1347,12 +1359,12 @@ function twiml(msg) {
   return '<?xml version="1.0" encoding="UTF-8"?><Response><Message>' + safe + '</Message></Response>';
 }
 const WA_MENU =
-  "👋 Bienvenue chez *TIINDA* — vos achats d'Europe livrés au Congo.\n\n" +
+  "👋 Bienvenue chez *TIINDA* : vos achats d'Europe livrés au Congo.\n\n" +
   "Répondez par un chiffre :\n" +
-  "*1* — Je suis déjà client Tiinda\n" +
-  "*2* — Je ne suis pas encore client\n" +
-  "*3* — Parler à un conseiller\n" +
-  "*4* — Suivre un colis";
+  "*1* : Je suis déjà client Tiinda\n" +
+  "*2* : Je ne suis pas encore client\n" +
+  "*3* : Parler à un conseiller\n" +
+  "*4* : Suivre un colis";
 
 // Journalise un contact entrant (WhatsApp/SMS/appel) en l'identifiant par numéro.
 async function logIncoming(phone, canal, message) {
@@ -1376,7 +1388,7 @@ app.post('/sms/incoming', express.urlencoded({ extended: false }), async (req, r
   const from = String(req.body.From || '').trim();
   const bodyRaw = String(req.body.Body || '').trim();
   logIncoming(from, 'sms', bodyRaw).catch(function(){});
-  res.send(twiml('Merci pour votre message. Pour une réponse rapide, contactez-nous sur WhatsApp ou via votre espace tiinda.com. — TIINDA'));
+  res.send(twiml('Merci pour votre message. Pour une réponse rapide, contactez-nous sur WhatsApp ou via votre espace tiinda.com. L\u2019équipe TIINDA'));
 });
 
 // ── Appel entrant (Twilio Voice) : identifie l'appelant + log + message ─────
@@ -1435,7 +1447,7 @@ app.post('/whatsapp/incoming', express.urlencoded({ extended: false }), async (r
             waState.set(from, { step: 'chat', tiinda_id: cli.tiinda_id });
             return res.send(twiml('✅ Ravi de vous revoir, *' + (cli.prenom || 'cher client') + '* !\n'
               + 'Votre identifiant : *' + cli.tiinda_id + '*\n'
-              + 'Forfait : ' + (cli.offre || '—') + ' · Solde : ' + Number(cli.wallet_balance || 0).toFixed(2) + ' €\n\n'
+              + 'Forfait : ' + (cli.offre || '-') + ' · Solde : ' + Number(cli.wallet_balance || 0).toFixed(2) + ' €\n\n'
               + 'Comment puis-je vous aider ? (suivi de colis, expédition, recharge…)\nTapez *menu* pour revenir au tri.'));
           }
         }
@@ -1467,7 +1479,7 @@ app.post('/whatsapp/incoming', express.urlencoded({ extended: false }), async (r
         if (cli) {
           waState.set(from, { step: 'chat', tiinda_id: cli.tiinda_id });
           return res.send(twiml('✅ Identifié : *' + (cli.prenom || 'client') + '* (' + cli.tiinda_id + ')\n'
-            + 'Forfait : ' + (cli.offre || '—') + ' · Solde : ' + Number(cli.wallet_balance || 0).toFixed(2) + ' €\n\n'
+            + 'Forfait : ' + (cli.offre || '-') + ' · Solde : ' + Number(cli.wallet_balance || 0).toFixed(2) + ' €\n\n'
             + 'Comment puis-je vous aider ?'));
         }
       }
@@ -1508,7 +1520,7 @@ app.post('/whatsapp/incoming', express.urlencoded({ extended: false }), async (r
   }
 });
 
-// (EMPLOYÉ) Statistiques rapides de l'entrepôt — comptage par statut.
+// (EMPLOYÉ) Statistiques rapides de l'entrepôt, comptage par statut.
 app.get('/scan/stats', requireScan, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
@@ -1545,7 +1557,7 @@ app.post('/visite', async (req, res) => {
 });
 
 /* ── 10) PANNEAU ADMIN (équipe Tiinda) ─────────────────────────────────────
-   Protégé par ADMIN_TOKEN — transmis UNIQUEMENT via le header x-admin-token
+   Protégé par ADMIN_TOKEN, transmis UNIQUEMENT via le header x-admin-token
    (plus jamais dans l'URL, pour ne pas fuiter dans les logs/historique). */
 /* ── Double authentification admin (mot de passe + Google Authenticator) ──
    - ADMIN_TOKEN        : mot de passe admin (variable Render)
@@ -1642,7 +1654,7 @@ function requireScan(req, res, next) {
   return res.status(401).json({ ok: false, error: 'unauthorized' });
 }
 
-// Liste tous les colis (avec infos client) — filtrable par statut.
+// Liste tous les colis (avec infos client), filtrable par statut.
 app.get('/admin/colis', requireAdmin, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
@@ -1700,7 +1712,7 @@ async function notifyColisStatus(clientId, colis) {
   if (cli.notif_email && cli.email && RESEND_API_KEY) {
     const html = '<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto"><div style="background:#0057FF;color:#fff;padding:18px;border-radius:12px 12px 0 0;text-align:center"><strong style="font-size:18px">TIINDA</strong></div><div style="border:1px solid #eee;border-top:none;padding:22px;border-radius:0 0 12px 12px"><p>Bonjour ' + (cli.prenom || '') + ',</p><p>Votre colis <strong>' + ref + '</strong> ' + action + '.</p><p style="font-size:12.5px;color:#666">Suivez votre colis depuis votre espace Tiinda.</p></div></div>';
     try {
-      await fetch('https://api.resend.com/emails', { method: 'POST', headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify({ from: MAIL_FROM || 'Tiinda <onboarding@resend.dev>', to: cli.email, subject: 'Tiinda — Mise à jour de votre colis ' + ref, html }) });
+      await fetch('https://api.resend.com/emails', { method: 'POST', headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify({ from: EXPEDITEUR, to: cli.email, subject: 'Tiinda : mise à jour de votre colis ' + ref, html }) });
     } catch (e) { console.error('notif mail error:', e.message); }
   }
 }
@@ -1822,10 +1834,10 @@ function placesCandidates(poidsKg, type) {
           out.push(`${al}-${String(ray).padStart(2, '0')}-${et}${pl}`);
   return out;
 }
-const ETAGE_LIB = { 1: 'étage 1 — au sol', 2: 'étage 2', 3: 'étage 3 — hauteur des yeux', 4: 'étage 4', 5: 'étage 5 — en haut' };
+const ETAGE_LIB = { 1: 'étage 1, au sol', 2: 'étage 2', 3: 'étage 3, hauteur des yeux', 4: 'étage 4', 5: 'étage 5, en haut' };
 
 /* Conteneur maritime Coolibo : trois zones, une par ville desservie.
-   Un colis Coolibo ne va jamais au rayonnage — il part dans le conteneur,
+   Un colis Coolibo ne va jamais au rayonnage, il part dans le conteneur,
    dans la zone de sa ville de destination. Une zone accueille des dizaines
    de colis : pas d'unicité à vérifier, contrairement aux casiers Tiinda. */
 const ZONES_COOLIBO = {
@@ -1897,7 +1909,7 @@ app.get('/admin/place/next', requireScan, async (req, res) => {
    plus la marche à suivre selon son mode d'envoi. */
 async function envoyerEtiquetteCoolibo(email, lignes) {
   if (!RESEND_API_KEY || !email || !lignes || !lignes.length) return;
-  const base = (process.env.SITE_URL || 'https://tiinda-otp.onrender.com').replace(/\/$/, '');
+  const base = API_BASE;
   const relais = lignes[0].mode === 'relais';
   const boutons = lignes.map((l) =>
     '<div style="margin:10px 0"><a href="' + base + '/coolibo/etiquette/' + l.tracking_interne + '"'
@@ -1923,7 +1935,7 @@ async function envoyerEtiquetteCoolibo(email, lignes) {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        from: MAIL_FROM || 'Coolibo <onboarding@resend.dev>', to: email,
+        from: EXPEDITEUR_COOLIBO, to: email,
         subject: 'Coolibo · votre étiquette (' + lignes.map((l) => l.tracking_interne).join(', ') + ')',
         html,
       }),
@@ -1982,7 +1994,7 @@ app.get('/coolibo/etiquette/:code', async (req, res) => {
       { day: '2-digit', month: '2-digit', year: 'numeric' }); } catch (e) { return ''; } };
     const emiseLe = dFR(e.created_at || Date.now());
     const ligne = (k, v) => `<tr><td style="padding:2mm 0;color:#6a7891;font-size:10pt;width:38mm">${htmlEsc(k)}</td>
-      <td style="padding:2mm 0;font-size:12pt;font-weight:700">${htmlEsc(v || '—')}</td></tr>`;
+      <td style="padding:2mm 0;font-size:12pt;font-weight:700">${htmlEsc(v || '-')}</td></tr>`;
 
     res.set('Content-Type', 'text/html; charset=utf-8').send(`<!doctype html><html lang="fr"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2024,7 +2036,7 @@ app.get('/coolibo/etiquette/:code', async (req, res) => {
     <table style="width:100%;border-collapse:collapse;margin:3mm 0">
       ${ligne('Expéditeur', e.email || '')}
       ${ligne('Enlèvement', [e.zip, e.ville].filter(Boolean).join(' '))}
-      ${ligne('Format', e.carton || '—')}
+      ${ligne('Format', e.carton || '-')}
       ${ligne('Émise le', emiseLe)}
       ${ligne('Remise', e.dest_mode === 'domicile' ? ('Livraison à domicile' + (e.dest_quartier ? ' · ' + e.dest_quartier : '')) : 'Retrait à l’agence')}
     </table>
@@ -2060,7 +2072,7 @@ app.get('/coolibo/commande/:ref', async (req, res) => {
   }
 });
 
-/* (EMPLOYÉ) Bons de préparation en attente — le poste Départ de Drancy les
+/* (EMPLOYÉ) Bons de préparation en attente, le poste Départ de Drancy les
    affiche et imprime automatiquement les nouveaux. */
 /* Bons en attente : uniquement ceux dont il reste des colis à sortir.
    Un bon entièrement expédié disparaît et ne peut plus être rouvert. */
@@ -2087,7 +2099,7 @@ app.get('/admin/picking/pending', requireScan, async (req, res) => {
       ok: true,
       pickings: [...par.values()]
         .sort((a, b) => a.picking.localeCompare(b.picking))
-        .map((g) => ({ picking: g.picking, colis: g.colis, client: nom.get(g.client_id) || '—', places: g.places.sort() })),
+        .map((g) => ({ picking: g.picking, colis: g.colis, client: nom.get(g.client_id) || '-', places: g.places.sort() })),
     });
   } catch (e) {
     res.json({ ok: false, error: 'exception' });
@@ -2202,7 +2214,7 @@ app.post('/admin/measure', requireScan, async (req, res) => {
     };
     /* Poids annoncé par le client à la commande : on le fige avant que la
        pesée ne l'écrase, et on enregistre l'écart. Aucune refacturation
-       automatique — l'administrateur tranche depuis le tableau de bord. */
+       automatique, l'administrateur tranche depuis le tableau de bord. */
     const decl = (colis.poids_declare != null) ? Number(colis.poids_declare)
                : (colis.poids != null ? Number(colis.poids) : null);
     if (colis.poids_declare == null && decl != null) patch.poids_declare = decl;
@@ -2399,7 +2411,7 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
     // CA du jour (abonnements créés aujourd'hui + frais d'envoi du jour)
     const PRICES = { bokolo: 9.99, familia: 19.90, mokili: 49.90 };
     let caToday = fraisEnvoiToday;
-    // Temps moyen de livraison (received_at → livre) — approximé via received_at des colis livrés
+    // Temps moyen de livraison (received_at → livre), approximé via received_at des colis livrés
     let delaiSum = 0, delaiN = 0;
     co.forEach(function (c) {
       byStatut[c.statut || 'declare'] = (byStatut[c.statut || 'declare'] || 0) + 1;
@@ -2426,7 +2438,7 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
     // Projection fin de mois (CA frais d'envoi du mois extrapolé)
     let fraisMois = 0; co.forEach(function (c) { if (c.created_at && new Date(c.created_at) >= monthStart) fraisMois += Number(c.frais_envoi || 0); });
     const projFinMois = monthDay > 0 ? Math.round((mrr + fraisMois) / monthDay * daysInMonth) : mrr;
-    // Ventes par code Tiinda (recharges validées) — comptées comme du CA à leur date.
+    // Ventes par code Tiinda (recharges validées), comptées comme du CA à leur date.
     let codeVentesToday = 0, codeVentesMois = 0;
     function codeAgg(since) { let t = 0; rch.forEach(function (r) { if (r.moyen === 'code' && r.created_at && new Date(r.created_at) >= since && Number(r.montant) > 0) t += Number(r.montant); }); return Math.round(t * 100) / 100; }
     codeVentesToday = codeAgg(dayStart);
@@ -3060,8 +3072,8 @@ app.post('/cron/rappels', async (req, res) => {
           await fetch('https://api.resend.com/emails', {
             method: 'POST',
             headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ from: MAIL_FROM || 'Tiinda <onboarding@resend.dev>',
-              to: c.email, subject: 'Tiinda — ' + titre, html })
+            body: JSON.stringify({ from: EXPEDITEUR,
+              to: c.email, subject: 'Tiinda : ' + titre, html })
           });
         } catch (e) { console.error('rappel mail:', e.message); }
       }
@@ -3092,5 +3104,5 @@ app.post('/cron/rappels', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`TIINDA backend en écoute sur le port ${PORT} — Supabase: ${db ? 'OK' : 'NON configuré'}`);
+  console.log(`TIINDA backend en écoute sur le port ${PORT}, Supabase: ${db ? 'OK' : 'NON configuré'}`);
 });
