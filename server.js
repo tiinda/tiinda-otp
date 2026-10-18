@@ -1779,6 +1779,13 @@ app.get('/scan/lookup', requireScan, async (req, res) => {
           poids: e.poids, longueur: e.longueur, largeur: e.largeur, hauteur: e.hauteur,
           frais_envoi: e.frais_envoi, emplacement: e.emplacement || null, picking: e.picking || null,
           received_at: e.received_at || null, created_at: e.created_at,
+          mode: e.mode || '',
+        },
+        /* Rendez-vous d'enlèvement IDF (mode « rdv ») : pris ou non par le client. */
+        rdv: {
+          pris: !!e.rdv_date,
+          date: e.rdv_date || null, creneau: e.rdv_creneau || '',
+          adresse: e.rdv_adresse || '', fait: e.rdv_fait === true,
         },
         client: {
           nom: e.dest_nom || e.email || '',
