@@ -1779,7 +1779,7 @@ app.get('/scan/lookup', requireScan, async (req, res) => {
           poids: e.poids, longueur: e.longueur, largeur: e.largeur, hauteur: e.hauteur,
           frais_envoi: e.frais_envoi, emplacement: e.emplacement || null, picking: e.picking || null,
           received_at: e.received_at || null, created_at: e.created_at,
-          mode: e.mode || '',
+          mode: e.mode || '', emplacement_prec: e.emplacement_prec || null,
         },
         /* Rendez-vous d'enlèvement IDF (mode « rdv ») : pris ou non par le client. */
         rdv: {
@@ -2201,7 +2201,7 @@ app.post('/admin/measure', requireScan, async (req, res) => {
     if (!colis) return res.json({ ok: false, error: 'colis_introuvable' });
     // Bloque la double réception/mesure (sauf code responsable).
     if ((colis.statut === 'recu' || colis.received_at) && !scanForced(b)) {
-      return res.json({ ok: false, error: 'deja_mesure', recu_le: colis.received_at || null, statut_actuel: colis.statut });
+      return res.json({ ok: false, error: 'deja_mesure', recu_le: colis.received_at || null, statut_actuel: colis.statut, emplacement: colis.emplacement || null });
     }
     const num = function (x) { return (x === '' || x == null) ? null : Number(x); };
     const L = num(b.longueur), W = num(b.largeur), H = num(b.hauteur), kg = num(b.poids);
@@ -2246,8 +2246,23 @@ app.post('/admin/measure', requireScan, async (req, res) => {
       }
       patch.emplacement = empl;
     }
-    const { data, error } = await db.from(table).update(patch).eq('id', colis.id).select().single();
-    if (error) { console.error('measure error:', error.message); return res.json({ ok: false, error: 'update_failed' }); }
+    let { data, error } = await db.from(table).update(patch).eq('id', colis.id).select().single();
+    /* Coolibo uniquement : « envois_coolibo » n'a pas forcément les colonnes propres à
+       Tiinda (type_colis, received_at, poids_declare, ecart_poids…). Si la mise à jour
+       complète est refusée, on garde l'essentiel : mesures, statut et emplacement. */
+    if (error && estCoolibo(code)) {
+      console.warn('measure coolibo (complet) refusé :', error.message);
+      const mini = { longueur: L, largeur: W, hauteur: H, poids: kg, statut: 'recu' };
+      if (patch.emplacement) mini.emplacement = patch.emplacement;
+      ({ data, error } = await db.from(table).update(mini).eq('id', colis.id).select().single());
+      if (error) {
+        console.warn('measure coolibo (mesures) refusé :', error.message);
+        const st = { statut: 'recu' };
+        if (patch.emplacement) st.emplacement = patch.emplacement;
+        ({ data, error } = await db.from(table).update(st).eq('id', colis.id).select().single());
+      }
+    }
+    if (error) { console.error('measure error:', error.message); return res.json({ ok: false, error: 'update_failed', detail: error.message }); }
     // Notifie le client (colis reçu + mesuré + prix d'expédition).
     if (colis.statut !== 'recu' && colis.client_id) notifyColisStatus(colis.client_id, data).catch(function(){});
     res.json({ ok: true, colis: data, frais_envoi: frais });
