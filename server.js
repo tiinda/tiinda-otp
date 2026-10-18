@@ -1735,6 +1735,24 @@ function scanForced(b) {
 const estCoolibo = (code) => /^CLB/i.test(String(code || '').trim());
 const tableDe = (code) => (estCoolibo(code) ? 'envois_coolibo' : 'colis');
 
+/* Coolibo uniquement : date réelle de chaque étape scannée, gardée dans la colonne
+   « etapes_dates » (jsonb) pour l'afficher sur la page de suivi client. Les clés
+   suivent les étapes de cette page. Sans effet si la colonne n'existe pas. */
+const ETAPE_CLB = { recu: 'recu_drancy', a_expedier: 'recu_drancy', expedie: 'transit_maritime',
+  arrive: 'dedouanement', disponible: 'disponible', livre: 'livre' };
+async function noterEtapeCoolibo(colis, statut) {
+  try {
+    const cle = ETAPE_CLB[statut];
+    if (!cle || !colis || !colis.id) return;
+    const maintenant = new Date().toISOString();
+    const dates = Object.assign({}, (colis.etapes_dates && typeof colis.etapes_dates === 'object') ? colis.etapes_dates : {});
+    if (!dates[cle]) dates[cle] = maintenant;
+    if (cle === 'recu_drancy' && colis.mode === 'rdv' && !dates.enleve) dates.enleve = maintenant;
+    const { error } = await db.from('envois_coolibo').update({ etapes_dates: dates }).eq('id', colis.id);
+    if (error) console.warn('etapes_dates coolibo :', error.message);
+  } catch (e) { console.warn('etapes_dates coolibo :', e.message); }
+}
+
 /* Un casier ne peut contenir qu'un colis, quelle que soit la marque :
    l'occupation se lit dans les deux tables à la fois. */
 async function casiersPris() {
@@ -2272,6 +2290,7 @@ app.post('/admin/measure', requireScan, async (req, res) => {
     if (error) { console.error('measure error:', error.message); return res.json({ ok: false, error: 'update_failed', detail: error.message }); }
     // Notifie le client (colis reçu + mesuré + prix d'expédition).
     if (colis.statut !== 'recu' && colis.client_id) notifyColisStatus(colis.client_id, data).catch(function(){});
+    if (estCoolibo(code)) await noterEtapeCoolibo(colis, 'recu');
     /* Coolibo : le prix est payé à la commande. On ne renvoie pas le tarif Tiinda
        (15 €/kg Congo), mais le montant réellement payé par le client. */
     if (estCoolibo(code)) {
@@ -2334,6 +2353,7 @@ app.post('/admin/scan', requireScan, async (req, res) => {
     }
     if (error) { console.error('scan update error:', error.message); return res.json({ ok: false, error: 'update_failed', detail: error.message, statut_actuel: colis.statut }); }
     if (colis.statut !== statut && colis.client_id) notifyColisStatus(colis.client_id, data).catch(function(){});
+    if (estCoolibo(code)) await noterEtapeCoolibo(colis, statut);
     // Émission auto de facture quand le colis part vers le Congo (frais d'envoi connus).
     if (!estCoolibo(code) && statut === 'expedie' && data.frais_envoi && colis.statut !== 'expedie') {
       emitInvoice(colis.client_id, 'Expédition ' + data.tracking_interne + ' vers le Congo', data.frais_envoi, data.tracking_interne).catch(function(){});
