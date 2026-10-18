@@ -2285,8 +2285,15 @@ app.post('/admin/scan', requireScan, async (req, res) => {
     }
     if (b.signature_url) patch.signature_url = b.signature_url;
     if (b.photo_url) patch.photo_url = b.photo_url;
-    const { data, error } = await db.from(table).update(patch).eq('id', colis.id).select().single();
-    if (error) { console.error('scan update error:', error.message); return res.json({ ok: false, error: 'update_failed' }); }
+    let { data, error } = await db.from(table).update(patch).eq('id', colis.id).select().single();
+    /* Coolibo uniquement : la table « envois_coolibo » n'a pas forcément toutes les
+       colonnes de la table Tiinda (received_at, emplacement_prec, libere_le…).
+       Si la mise à jour complète est refusée, on réessaie avec le statut seul. */
+    if (error && estCoolibo(code)) {
+      console.warn('scan update coolibo (complet) refusé :', error.message, ': nouvel essai statut seul');
+      ({ data, error } = await db.from(table).update({ statut: statut }).eq('id', colis.id).select().single());
+    }
+    if (error) { console.error('scan update error:', error.message); return res.json({ ok: false, error: 'update_failed', detail: error.message, statut_actuel: colis.statut }); }
     if (colis.statut !== statut && colis.client_id) notifyColisStatus(colis.client_id, data).catch(function(){});
     // Émission auto de facture quand le colis part vers le Congo (frais d'envoi connus).
     if (!estCoolibo(code) && statut === 'expedie' && data.frais_envoi && colis.statut !== 'expedie') {
