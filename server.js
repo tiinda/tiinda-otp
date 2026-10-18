@@ -2272,6 +2272,12 @@ app.post('/admin/measure', requireScan, async (req, res) => {
     if (error) { console.error('measure error:', error.message); return res.json({ ok: false, error: 'update_failed', detail: error.message }); }
     // Notifie le client (colis reçu + mesuré + prix d'expédition).
     if (colis.statut !== 'recu' && colis.client_id) notifyColisStatus(colis.client_id, data).catch(function(){});
+    /* Coolibo : le prix est payé à la commande. On ne renvoie pas le tarif Tiinda
+       (15 €/kg Congo), mais le montant réellement payé par le client. */
+    if (estCoolibo(code)) {
+      const paye = Math.max(0, (Number(colis.frais_envoi) || 0) - (Number(colis.remise) || 0));
+      return res.json({ ok: true, colis: data, frais_envoi: null, prix_paye: colis.frais_envoi != null ? Math.round(paye * 100) / 100 : null });
+    }
     res.json({ ok: true, colis: data, frais_envoi: frais });
   } catch (err) {
     console.error('measure error:', err.message);
