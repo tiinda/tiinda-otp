@@ -1764,7 +1764,11 @@ app.get('/scan/lookup', requireScan, async (req, res) => {
       const { data: e } = await db.from('envois_coolibo').select('*')
         .or('tracking_interne.eq.' + code + ',tracking_externe.eq.' + code).limit(1).maybeSingle();
       if (!e) return res.json({ ok: false, error: 'colis_introuvable' });
-      const dom = e.mode === 'domicile';
+      /* Mode Coolibo : « relais » = dépôt en point relais Mondial Relay ;
+         « rdv » (ou domicile / enlèvement) = enlèvement à domicile en Île-de-France. */
+      const modeClb = String(e.mode || '').toLowerCase();
+      const libMode = modeClb === 'relais' ? 'Coolibo · point relais'
+        : (['rdv', 'domicile', 'enlevement', 'enlèvement', 'idf'].includes(modeClb) ? 'Coolibo · enlèvement IDF' : 'Coolibo');
       return res.json({
         ok: true,
         marque: 'coolibo',
@@ -1778,7 +1782,7 @@ app.get('/scan/lookup', requireScan, async (req, res) => {
         },
         client: {
           nom: e.dest_nom || e.email || '',
-          tiinda_id: dom ? 'Coolibo · domicile' : 'Coolibo · point relais',
+          tiinda_id: libMode,
           phone: e.dest_phone || '',
           ville: [e.zip, e.ville].filter(Boolean).join(' '),
         },
