@@ -276,14 +276,10 @@ async function signalerCommandeOrpheline(order, email, orderRef, lignesForfait, 
   }
 }
 
-/* Génère « CLB-2026-7KPYIW », année + 6 caractères base36. */
+/* Génère un numéro Coolibo au format « CLB » + 9 chiffres (ex. CLB782887126).
+   L'ancien format « CLB-2026-7KPYIW » reste reconnu partout pour les colis déjà étiquetés. */
 function genTrackingCoolibo() {
-  const y = new Date().getFullYear();
-  let r = '';
-  const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  const b = crypto.randomBytes(6);
-  for (let i = 0; i < 6; i++) r += A[b[i] % A.length];
-  return 'CLB-' + y + '-' + r;
+  return 'CLB' + String(crypto.randomInt(0, 1000000000)).padStart(9, '0');
 }
 
 async function coolliboDepuisCommande(order) {
@@ -1981,7 +1977,7 @@ const htmlEsc = (t) => String(t == null ? '' : t)
 app.get('/coolibo/etiquette/:code', async (req, res) => {
   try {
     const code = String(req.params.code || '').trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
-    if (!db || !/^CLB-\d{4}-[A-Z0-9]{6}$/.test(code)) return res.status(404).send('Étiquette introuvable.');
+    if (!db || !/^(CLB\d{9}|CLB-\d{4}-[A-Z0-9]{6})$/.test(code)) return res.status(404).send('Étiquette introuvable.');
     const { data: e } = await db.from('envois_coolibo').select('*')
       .eq('tracking_interne', code).limit(1).maybeSingle();
     if (!e) return res.status(404).send('Étiquette introuvable.');
