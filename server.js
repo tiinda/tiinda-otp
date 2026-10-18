@@ -2251,16 +2251,23 @@ app.post('/admin/measure', requireScan, async (req, res) => {
        Tiinda (type_colis, received_at, poids_declare, ecart_poids…). Si la mise à jour
        complète est refusée, on garde l'essentiel : mesures, statut et emplacement. */
     if (error && estCoolibo(code)) {
-      console.warn('measure coolibo (complet) refusé :', error.message);
-      const mini = { longueur: L, largeur: W, hauteur: H, poids: kg, statut: 'recu' };
-      if (patch.emplacement) mini.emplacement = patch.emplacement;
-      ({ data, error } = await db.from(table).update(mini).eq('id', colis.id).select().single());
-      if (error) {
-        console.warn('measure coolibo (mesures) refusé :', error.message);
-        const st = { statut: 'recu' };
-        if (patch.emplacement) st.emplacement = patch.emplacement;
-        ({ data, error } = await db.from(table).update(st).eq('id', colis.id).select().single());
+      /* Coolibo uniquement : la table « envois_coolibo » n'a pas forcément toutes les
+         colonnes de la table Tiinda. On réessaie avec de moins en moins de champs,
+         et on renvoie le premier message d'erreur pour savoir quoi corriger. */
+      const premiere = error.message;
+      console.warn('measure coolibo (complet) refusé :', premiere);
+      const essais = [];
+      const base = { longueur: L, largeur: W, hauteur: H, poids: kg, statut: 'recu' };
+      if (patch.emplacement) essais.push(Object.assign({}, base, { emplacement: patch.emplacement }));
+      essais.push(base);
+      if (patch.emplacement) essais.push({ statut: 'recu', emplacement: patch.emplacement });
+      essais.push({ statut: 'recu' });
+      for (const essai of essais) {
+        ({ data, error } = await db.from(table).update(essai).eq('id', colis.id).select().single());
+        if (!error) break;
+        console.warn('measure coolibo refusé', Object.keys(essai).join(','), ':', error.message);
       }
+      if (error) error.message = premiere + ' | ' + error.message;
     }
     if (error) { console.error('measure error:', error.message); return res.json({ ok: false, error: 'update_failed', detail: error.message }); }
     // Notifie le client (colis reçu + mesuré + prix d'expédition).
