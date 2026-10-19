@@ -363,7 +363,9 @@ const CORS_LIST = (ALLOWED_ORIGINS || 'https://tiinda.com,https://www.tiinda.com
 function originAllowed(origin) {
   if (!origin) return false;
   if (CORS_LIST.indexOf(origin) >= 0) return true;
-  try { var h = new URL(origin).hostname; return /\.myshopify\.com$/.test(h) || h === 'tiinda.com' || h === 'www.tiinda.com'; }
+  try { var h = new URL(origin).hostname; return /\.myshopify\.com$/.test(h) || h === 'tiinda.com' || h === 'www.tiinda.com'
+    /* Coolibo : page Agence et outils Coolibo hébergés sur coolibo.com */
+    || h === 'coolibo.com' || h === 'www.coolibo.com'; }
   catch (e) { return false; }
 }
 app.use((req, res, next) => {
