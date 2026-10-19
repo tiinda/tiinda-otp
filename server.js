@@ -1775,6 +1775,22 @@ async function casiersPris() {
 }
 
 // (EMPLOYÉ) Recherche d'un colis par numéro → statut + infos (lecture seule).
+/* Coolibo : points de retrait au Congo (agences et futurs points relais), gérés dans
+   la table « points_retrait_coolibo ». Liste par défaut si la table n'existe pas encore. */
+const POINTS_DEFAUT = [
+  { id: 'BZV-AG', ville: 'Brazzaville', nom: 'Agence de Brazzaville', type: 'agence', adresse: '' },
+  { id: 'PNR-AG', ville: 'Pointe-Noire', nom: 'Agence de Pointe-Noire', type: 'agence', adresse: '' },
+  { id: 'DLS-AG', ville: 'Dolisie', nom: 'Agence de Dolisie', type: 'agence', adresse: '' },
+];
+app.get('/scan/points', requireScan, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: true, points: POINTS_DEFAUT });
+    const { data, error } = await db.from('points_retrait_coolibo').select('*').eq('actif', true).order('ville').order('ordre');
+    if (error || !data || !data.length) return res.json({ ok: true, points: POINTS_DEFAUT });
+    res.json({ ok: true, points: data.map((p) => ({ id: p.code, ville: p.ville, nom: p.nom, type: p.type || 'agence', adresse: p.adresse || '', horaires: p.horaires || '' })) });
+  } catch (e) { res.json({ ok: true, points: POINTS_DEFAUT }); }
+});
+
 app.get('/scan/lookup', requireScan, async (req, res) => {
   try {
     if (!db) return res.json({ ok: false, error: 'no_db' });
@@ -1801,6 +1817,8 @@ app.get('/scan/lookup', requireScan, async (req, res) => {
           frais_envoi: e.frais_envoi, emplacement: e.emplacement || null, picking: e.picking || null,
           received_at: e.received_at || null, created_at: e.created_at,
           mode: e.mode || '', emplacement_prec: e.emplacement_prec || null,
+          agence: e.agence || null, point_retrait: e.point_retrait || null, conteneur: e.conteneur || null, dest_ville: e.dest_ville || '',
+          retire_par: e.retire_par || null, retire_le: e.retire_le || null,
         },
         /* Rendez-vous d'enlèvement IDF (mode « rdv ») : pris ou non par le client. */
         rdv: {
@@ -2339,8 +2357,25 @@ app.post('/admin/scan', requireScan, async (req, res) => {
     if (estCoolibo(code) && statut === 'expedie' && !colis.conteneur && !scanForced(b)) {
       return res.json({ ok: false, error: 'conteneur_non_cloture', statut_actuel: colis.statut });
     }
+    /* Coolibo uniquement : étapes réalisées dans les agences du Congo
+       (Brazzaville, Pointe-Noire, Dolisie). */
+    const etapeCongo = estCoolibo(code) && ['arrive', 'disponible', 'livre'].includes(statut);
+    if (etapeCongo && !colis.conteneur && !scanForced(b)) {
+      return res.json({ ok: false, error: 'pas_encore_expedie', statut_actuel: colis.statut });
+    }
+    if (estCoolibo(code) && statut === 'livre' && !scanForced(b)) {
+      if (!b.signature_url) return res.json({ ok: false, error: 'signature_requise' });
+      if (!String(b.retire_par || '').trim()) return res.json({ ok: false, error: 'nom_retrait_requis' });
+    }
     const patch = { statut: statut };
     if (statut === 'recu') patch.received_at = new Date().toISOString();
+    /* Ville de l'agence et point de retrait précis (une ville peut avoir plusieurs points) */
+    if (etapeCongo && String(b.agence || '').trim()) patch.agence = String(b.agence).trim().slice(0, 40);
+    if (etapeCongo && String(b.point || '').trim()) patch.point_retrait = String(b.point).trim().slice(0, 80);
+    if (estCoolibo(code) && statut === 'livre') {
+      patch.retire_par = String(b.retire_par || '').trim().slice(0, 80);
+      patch.retire_le = new Date().toISOString();
+    }
     /* Place libérée dès que le colis quitte le dépôt France. On garde l'ancien
        casier et l'heure : il reste en quarantaine quelques heures pour ne pas
        être réattribué à un colis pendant qu'on le sort encore du rayonnage. */
@@ -2356,8 +2391,15 @@ app.post('/admin/scan', requireScan, async (req, res) => {
        colonnes de la table Tiinda (received_at, emplacement_prec, libere_le…).
        Si la mise à jour complète est refusée, on réessaie avec le statut seul. */
     if (error && estCoolibo(code)) {
-      console.warn('scan update coolibo (complet) refusé :', error.message, ': nouvel essai statut seul');
-      ({ data, error } = await db.from(table).update({ statut: statut }).eq('id', colis.id).select().single());
+      console.warn('scan update coolibo (complet) refusé :', error.message, ': nouvel essai réduit');
+      const mini = { statut: statut };
+      if (patch.signature_url) mini.signature_url = patch.signature_url;   // la signature ne doit jamais se perdre
+      ({ data, error } = await db.from(table).update(mini).eq('id', colis.id).select().single());
+      if (error && mini.signature_url) {
+        console.error('signature coolibo non enregistrée :', error.message);
+        return res.json({ ok: false, error: 'update_failed', detail: 'signature non enregistrée : ' + error.message, statut_actuel: colis.statut });
+      }
+      if (error) ({ data, error } = await db.from(table).update({ statut: statut }).eq('id', colis.id).select().single());
     }
     if (error) { console.error('scan update error:', error.message); return res.json({ ok: false, error: 'update_failed', detail: error.message, statut_actuel: colis.statut }); }
     if (colis.statut !== statut && colis.client_id) notifyColisStatus(colis.client_id, data).catch(function(){});
