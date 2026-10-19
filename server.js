@@ -1717,7 +1717,10 @@ async function notifyColisStatus(clientId, colis) {
    Un scan ne peut que faire AVANCER le colis. Retour en arrière ou re-scan
    de la même étape : refusé, et le client n'est pas notifié. Un responsable
    peut forcer avec le code SCAN_OVERRIDE_CODE (variable d'environnement). */
-const SCAN_ORDER = { declare: 0, recu: 1, a_expedier: 1, expedie: 2, arrive: 3, disponible: 4, livre: 5 };
+const SCAN_ORDER = { declare: 0, recu: 1, a_expedier: 1, expedie: 2, arrive: 3, disponible: 4, livre: 5,
+  /* Statuts Coolibo validés depuis l'admin ou la clôture du conteneur (jamais utilisés par Tiinda) :
+     on les range au même niveau pour qu'un colis ne recule jamais au scan. */
+  enleve: 0.5, recu_drancy: 1, transit_maritime: 2, port: 3, arrive_port: 3, dedouanement: 3 };
 function scanRank(s) {
   const r = SCAN_ORDER[String(s || '').toLowerCase()];
   return r === undefined ? -1 : r;
