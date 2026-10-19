@@ -2334,6 +2334,11 @@ app.post('/admin/scan', requireScan, async (req, res) => {
       }
       if (scanForced(b)) console.warn('scan forcé:', colis.tracking_interne, colis.statut, '->', statut);
     }
+    /* Coolibo uniquement : un colis reçu à Drancy ne part en transit maritime qu'à la
+       clôture du conteneur (tableau de bord). Le scan « Départ » est refusé avant. */
+    if (estCoolibo(code) && statut === 'expedie' && !colis.conteneur && !scanForced(b)) {
+      return res.json({ ok: false, error: 'conteneur_non_cloture', statut_actuel: colis.statut });
+    }
     const patch = { statut: statut };
     if (statut === 'recu') patch.received_at = new Date().toISOString();
     /* Place libérée dès que le colis quitte le dépôt France. On garde l'ancien
