@@ -2407,7 +2407,10 @@ app.post('/admin/scan', requireScan, async (req, res) => {
     if (colis.statut !== statut && colis.client_id) notifyColisStatus(colis.client_id, data).catch(function(){});
     if (estCoolibo(code)) await noterEtapeCoolibo(colis, statut);
     // Émission auto de facture quand le colis part vers le Congo (frais d'envoi connus).
-    if (!estCoolibo(code) && statut === 'expedie' && data.frais_envoi && colis.statut !== 'expedie') {
+    // Pas de seconde facture si le client a déjà payé sa demande d'expédition
+    // (bon de préparation PK-… : la facture est émise à ce moment-là).
+    if (!estCoolibo(code) && statut === 'expedie' && data.frais_envoi && colis.statut !== 'expedie'
+        && !colis.picking && colis.statut !== 'a_expedier') {
       emitInvoice(colis.client_id, 'Expédition ' + data.tracking_interne + ' vers le Congo', data.frais_envoi, data.tracking_interne).catch(function(){});
     }
     res.json({ ok: true, colis: data });
