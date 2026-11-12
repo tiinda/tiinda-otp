@@ -2406,6 +2406,7 @@ app.post('/admin/scan', requireScan, async (req, res) => {
     if (error) { console.error('scan update error:', error.message); return res.json({ ok: false, error: 'update_failed', detail: error.message, statut_actuel: colis.statut }); }
     if (colis.statut !== statut && colis.client_id) notifyColisStatus(colis.client_id, data).catch(function(){});
     if (estCoolibo(code)) await noterEtapeCoolibo(colis, statut);
+    else if (colis.statut !== statut) await noterEtapeTiinda(colis.id, statut);
     // Émission auto de facture quand le colis part vers le Congo (frais d'envoi connus).
     // Pas de seconde facture si le client a déjà payé sa demande d'expédition
     // (bon de préparation PK-… : la facture est émise à ce moment-là).
@@ -2443,6 +2444,7 @@ app.post('/admin/colis/update', requireAdmin, async (req, res) => {
     // Notifie le client si le STATUT a changé.
     if (b.statut && before && before.statut !== b.statut) {
       notifyColisStatus(before.client_id, data).catch(function(){});
+      await noterEtapeTiinda(b.id, b.statut);
     }
     res.json({ ok: true, colis: data });
   } catch (err) {
@@ -3216,6 +3218,150 @@ app.post('/cron/rappels', async (req, res) => {
     res.json({ ok: true, candidats: (liste || []).length, envoyes: envoyes });
   } catch (err) {
     console.error('cron rappels error:', err.message);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+/* ── ÉCRANS DE CONTRÔLE TIINDA (lecture seule) ─────────────────────────────
+   Tiinda uniquement (table « colis »). Coolibo n'est pas concerné.
+
+   Heure de chaque étape : colonnes ajoutées à la table « colis » (SQL Editor) :
+
+     alter table colis
+       add column if not exists expedie_at    timestamptz,
+       add column if not exists arrive_at     timestamptz,
+       add column if not exists disponible_at timestamptz,
+       add column if not exists livre_at      timestamptz;
+
+   L'heure est écrite APRÈS la mise à jour du statut, dans une requête séparée :
+   si les colonnes n'existent pas encore, le scan fonctionne exactement comme avant. */
+const ETAPE_TND = { expedie: 'expedie_at', arrive: 'arrive_at', disponible: 'disponible_at', livre: 'livre_at' };
+async function noterEtapeTiinda(colisId, statut) {
+  try {
+    const col = ETAPE_TND[statut];
+    if (!db || !col || !colisId) return;
+    const { error } = await db.from('colis').update({ [col]: new Date().toISOString() }).eq('id', colisId).is(col, null);
+    if (error) console.warn('heure étape tiinda :', error.message);
+  } catch (e) { console.warn('heure étape tiinda :', e.message); }
+}
+
+/* Début de journée à l'heure de Paris (le serveur Render tourne en UTC). */
+function debutJourParis(decalJours) {
+  const ymd = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Paris', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+  const [y, m, d] = ymd.split('-').map(Number);
+  const guess = Date.UTC(y, m - 1, d - (decalJours || 0));
+  const enParis = new Date(new Date(guess).toLocaleString('en-US', { timeZone: 'Europe/Paris' }));
+  const enUtc = new Date(new Date(guess).toLocaleString('en-US', { timeZone: 'UTC' }));
+  return new Date(guess - (enParis - enUtc));
+}
+const FMT_HEURE_PARIS = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Paris', hour: '2-digit', hourCycle: 'h23' });
+const heureParis = (iso) => Number(FMT_HEURE_PARIS.formatToParts(new Date(iso)).find((p) => p.type === 'hour').value);
+const hhmmParis = (iso) => new Intl.DateTimeFormat('fr-FR', { timeZone: 'Europe/Paris', hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
+
+/* Les écrans interrogent toutes les 5 s : un seul calcul toutes les 4 s,
+   partagé entre tous les écrans allumés. */
+let ecranCache = { at: 0, data: null };
+
+app.get('/admin/ecran', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: false, error: 'no_db' });
+    if (ecranCache.data && Date.now() - ecranCache.at < 4000) return res.json({ ok: true, ecran: ecranCache.data });
+
+    const auj = debutJourParis(0), hier = debutJourParis(1);
+    const aujISO = auj.toISOString(), hierISO = hier.toISOString();
+    const maintenant = Date.now();
+    const memeHeureHier = new Date(hier.getTime() + (maintenant - auj.getTime()));
+    const il7j = new Date(maintenant - 7 * 86400000).toISOString();
+    const nb = (q) => q.then((r) => r.count || 0);
+
+    const [declares, recus, sortis, sortisRepli, arrives, retires, rch, recus_fact, inscrits,
+      attendus, aPreparer, disponibles, dispoAnciens, vis] = await Promise.all([
+      db.from('colis').select('tracking_interne, created_at').gte('created_at', hierISO),
+      db.from('colis').select('tracking_interne, received_at, poids').gte('received_at', aujISO),
+      db.from('colis').select('tracking_interne, expedie_at, poids').gte('expedie_at', aujISO),
+      /* Repli tant que expedie_at n'existe pas : heure de libération du casier. */
+      db.from('colis').select('tracking_interne, libere_le, poids, statut').gte('libere_le', aujISO),
+      db.from('colis').select('id', { count: 'exact', head: true }).gte('arrive_at', aujISO),
+      db.from('colis').select('id', { count: 'exact', head: true }).gte('livre_at', aujISO),
+      db.from('recharges').select('montant, moyen, created_at').gte('created_at', hierISO),
+      db.from('factures').select('montant, created_at').like('numero', 'TND-REC-%').gte('created_at', hierISO),
+      db.from('clients').select('offre, created_at').gte('created_at', aujISO),
+      nb(db.from('colis').select('id', { count: 'exact', head: true }).eq('statut', 'declare')),
+      nb(db.from('colis').select('id', { count: 'exact', head: true }).eq('statut', 'a_expedier')),
+      nb(db.from('colis').select('id', { count: 'exact', head: true }).eq('statut', 'disponible')),
+      nb(db.from('colis').select('id', { count: 'exact', head: true }).eq('statut', 'disponible').lt('disponible_at', il7j)),
+      db.from('visites').select('count').eq('jour', new Date().toISOString().slice(0, 10)).maybeSingle(),
+    ]);
+
+    const estAuj = (iso) => iso && new Date(iso) >= auj;
+    const avantMemeHeureHier = (iso) => iso && new Date(iso) >= hier && new Date(iso) < memeHeureHier;
+    const rond = (n) => Math.round(n * 100) / 100;
+
+    // Colis
+    const decl = declares.data || [];
+    const listeRecus = (recus.data || []).sort((a, b) => new Date(b.received_at) - new Date(a.received_at));
+    let listeSortis = (sortis.data || []).map((c) => ({ code: c.tracking_interne, t: c.expedie_at, poids: c.poids }));
+    if (sortis.error) {
+      listeSortis = (sortisRepli.data || []).filter((c) => ['expedie', 'arrive', 'disponible', 'livre'].includes(c.statut))
+        .map((c) => ({ code: c.tracking_interne, t: c.libere_le, poids: c.poids }));
+    }
+    listeSortis.sort((a, b) => new Date(b.t) - new Date(a.t));
+
+    const heures = []; for (let h = 8; h <= 19; h++) heures.push(h);
+    const parHeure = (liste, champ) => heures.map((h) => liste.filter((x) => {
+      const hh = heureParis(x[champ]); return h === 8 ? hh <= 8 : (h === 19 ? hh >= 19 : hh === h);
+    }).length);
+
+    // Argent : recharges payées (carte + codes, montant réellement payé) + abonnements carte
+    const rc = rch.data || [], fr = recus_fact.data || [];
+    const somme = (liste, filtre) => rond(liste.filter(filtre).reduce((s, r) => s + Number(r.montant || 0), 0));
+    const rechargesAuj = somme(fr, (f) => estAuj(f.created_at));
+    const rechargesHier = somme(fr, (f) => avantMemeHeureHier(f.created_at));
+    const nbRecharges = fr.filter((f) => estAuj(f.created_at)).length;
+    const abos = rc.filter((r) => r.moyen === 'abonnement' && estAuj(r.created_at));
+    const abosAuj = rond(abos.reduce((s, r) => s + Number(r.montant || 0), 0));
+    const abosHier = somme(rc, (r) => r.moyen === 'abonnement' && avantMemeHeureHier(r.created_at));
+    const expeditionsAuj = rond(-somme(rc, (r) => r.moyen === 'expedition' && estAuj(r.created_at)));
+
+    const data = {
+      maj: new Date().toISOString(),
+      colis: {
+        declares: decl.filter((c) => estAuj(c.created_at)).length,
+        declares_hier: decl.filter((c) => !estAuj(c.created_at)).length,
+        recus: listeRecus.length,
+        sortis: listeSortis.length,
+        attendus: attendus,
+        a_preparer: aPreparer,
+        poids_recu: rond(listeRecus.reduce((s, c) => s + Number(c.poids || 0), 0)),
+        poids_sorti: rond(listeSortis.reduce((s, c) => s + Number(c.poids || 0), 0)),
+        heures: heures,
+        recus_par_heure: parHeure(listeRecus, 'received_at'),
+        sortis_par_heure: parHeure(listeSortis, 't'),
+        derniers_recus: listeRecus.slice(0, 5).map((c) => ({ code: c.tracking_interne, heure: hhmmParis(c.received_at) })),
+        derniers_sortis: listeSortis.slice(0, 5).map((c) => ({ code: c.code, heure: hhmmParis(c.t) })),
+      },
+      argent: {
+        encaisse: rond(rechargesAuj + abosAuj),
+        encaisse_hier_meme_heure: rond(rechargesHier + abosHier),
+        recharges: rechargesAuj, nb_recharges: nbRecharges,
+        abonnements: abosAuj, nb_abonnements: abos.length,
+        expeditions_payees: expeditionsAuj,
+      },
+      clients: {
+        inscrits: (inscrits.data || []).length,
+        visiteurs: (vis && vis.data && Number(vis.data.count)) || 0,
+      },
+      congo: {
+        arrives: arrives.error ? null : (arrives.count || 0),
+        disponibles: disponibles,
+        retires: retires.error ? null : (retires.count || 0),
+        attente_7j: dispoAnciens,
+      },
+    };
+    ecranCache = { at: Date.now(), data: data };
+    res.json({ ok: true, ecran: data });
+  } catch (err) {
+    console.error('admin ecran error:', err.message);
     res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
