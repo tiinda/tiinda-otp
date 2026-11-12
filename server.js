@@ -3293,6 +3293,41 @@ app.get('/admin/ecran', requireAdmin, async (req, res) => {
       db.from('visites').select('count').eq('jour', new Date().toISOString().slice(0, 10)).maybeSingle(),
     ]);
 
+    /* Stockage dépassé : mêmes règles que la page « Mes colis » de l'espace client.
+       Colis au statut « recu » uniquement. Fin du gratuit = stockage_fin (base),
+       sinon réception + jours inclus du forfait. Tarif par jour selon le volume. */
+    let enStock = await db.from('colis').select('tracking_interne, longueur, largeur, hauteur, received_at, stockage_fin, client_id').eq('statut', 'recu');
+    if (enStock.error) enStock = await db.from('colis').select('tracking_interne, longueur, largeur, hauteur, received_at, client_id').eq('statut', 'recu');
+    const stock = enStock.data || [];
+    const idsCli = [...new Set(stock.map((c) => c.client_id).filter(Boolean))];
+    const offres = new Map();
+    if (idsCli.length) {
+      const { data: cls } = await db.from('clients').select('id, offre').in('id', idsCli);
+      (cls || []).forEach((c) => offres.set(c.id, c.offre));
+    }
+    const JOURS_GRATUITS = { decouverte: 7, bokolo: 30, familia: 30, mokili: 40 };
+    const planDe = (o) => { o = String(o || '').toLowerCase(); return o.indexOf('mokili') >= 0 ? 'mokili' : o.indexOf('familia') >= 0 ? 'familia' : o.indexOf('bokolo') >= 0 ? 'bokolo' : 'decouverte'; };
+    const tarifJour = (c, plan) => {
+      if (plan === 'mokili') return 0;
+      const L = Number(c.longueur || 0), W = Number(c.largeur || 0), H = Number(c.hauteur || 0);
+      const vol = (L && W && H) ? (L * W * H) / 1000 : 0;
+      let t = vol <= 20 ? 0.30 : vol <= 60 ? 0.50 : vol <= 150 ? 1.00 : 2.00;
+      if (plan === 'familia') t = t * 0.6;
+      return Math.round(t * 100) / 100;
+    };
+    const depasses = [];
+    stock.forEach((c) => {
+      const plan = planDe(offres.get(c.client_id));
+      let fin = c.stockage_fin ? new Date(c.stockage_fin) : null;
+      if ((!fin || isNaN(fin.getTime())) && c.received_at) fin = new Date(new Date(c.received_at).getTime() + JOURS_GRATUITS[plan] * 86400000);
+      if (!fin || isNaN(fin.getTime())) return;
+      const diff = (fin.getTime() - maintenant) / 86400000;
+      if (diff > 0) return;
+      const jours = Math.ceil(-diff);
+      depasses.push({ code: c.tracking_interne, jours: jours, frais: Math.round(jours * tarifJour(c, plan) * 100) / 100 });
+    });
+    depasses.sort((a, b) => b.frais - a.frais || b.jours - a.jours);
+
     const estAuj = (iso) => iso && new Date(iso) >= auj;
     const avantMemeHeureHier = (iso) => iso && new Date(iso) >= hier && new Date(iso) < memeHeureHier;
     const rond = (n) => Math.round(n * 100) / 100;
@@ -3339,6 +3374,11 @@ app.get('/admin/ecran', requireAdmin, async (req, res) => {
         sortis_par_heure: parHeure(listeSortis, 't'),
         derniers_recus: listeRecus.slice(0, 5).map((c) => ({ code: c.tracking_interne, heure: hhmmParis(c.received_at) })),
         derniers_sortis: listeSortis.slice(0, 5).map((c) => ({ code: c.code, heure: hhmmParis(c.t) })),
+        stockage_depasse: {
+          nb: depasses.length,
+          frais: rond(depasses.reduce((s, d) => s + d.frais, 0)),
+          liste: depasses.slice(0, 4),
+        },
       },
       argent: {
         encaisse: rond(rechargesAuj + abosAuj),
