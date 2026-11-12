@@ -3377,7 +3377,7 @@ app.get('/admin/ecran', requireAdmin, async (req, res) => {
         stockage_depasse: {
           nb: depasses.length,
           frais: rond(depasses.reduce((s, d) => s + d.frais, 0)),
-          liste: depasses.slice(0, 4),
+          liste: depasses.slice(0, 24),
         },
       },
       argent: {
