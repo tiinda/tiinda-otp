@@ -270,15 +270,63 @@ module.exports = function brancherOperateur(app, o) {
   });
 
   /* Réception d'un vol : scan du colis puis de la case où il est rangé → disponible. */
+  /* Emplacements de l'agence de Brazzaville : étagères A à D, 25 cases chacune (A01 … D25).
+     Pour agrandir sans toucher au code : variables Render OP_ETAGERES (ex. A,B,C,D,E) et OP_CASES (ex. 30). */
+  const ETAGERES = String(process.env.OP_ETAGERES || 'A,B,C,D').split(',').map((x) => x.trim().toUpperCase()).filter(Boolean);
+  const CASES_PAR_ETAGERE = Math.max(1, parseInt(process.env.OP_CASES || '25', 10) || 25);
+  const EMPLACEMENTS = [];
+  ETAGERES.forEach((e) => { for (let i = 1; i <= CASES_PAR_ETAGERE; i++) EMPLACEMENTS.push(e + String(i).padStart(2, '0')); });
+  async function choisirEmplacement(colis) {
+    const { data } = await db.from('colis').select('client_id, case_congo').eq('statut', 'disponible').limit(5000);
+    const occupes = (data || []).filter((x) => x.case_congo);
+    if (colis.client_id) {
+      const meme = occupes.find((x) => x.client_id === colis.client_id);
+      if (meme) return { case: meme.case_congo, meme_client: true };
+    }
+    const prises = new Set(occupes.map((x) => x.case_congo));
+    const libre = EMPLACEMENTS.find((x) => !prises.has(x));
+    return libre ? { case: libre, meme_client: false } : null;
+  }
+
+  /* Réception d'un vol, en deux temps avec double contrôle :
+     1) /op/reception/proposer : on scanne le colis, le système donne l'emplacement (rien n'est enregistré) ;
+     2) /op/reception : on scanne l'étiquette de l'emplacement ; si c'est le bon, le colis passe « disponible » et le client est prévenu. */
+  async function verifierColisReception(tnd) {
+    const c = await trouverColis(tnd);
+    if (!c) return { erreur: { ok: false, error: 'colis_introuvable' } };
+    if (['disponible', 'livre'].includes(c.statut)) return { erreur: { ok: false, error: 'deja_scanne', statut_actuel: c.statut, case_congo: c.case_congo || null } };
+    if (!['expedie', 'arrive'].includes(c.statut)) return { erreur: { ok: false, error: 'pas_encore_expedie', statut_actuel: c.statut } };
+    return { colis: c };
+  }
+  const normCase = (v) => String(v || '').trim().toUpperCase().replace(/^EMP[-\s]?/, '').replace(/[^A-Z0-9]/g, '').slice(0, 12);
+
+  app.get('/op/emplacements', requireOp, (req, res) => res.json({ ok: true, etageres: ETAGERES, cases_par_etagere: CASES_PAR_ETAGERE, emplacements: EMPLACEMENTS }));
+
+  app.post('/op/reception/proposer', requireOp, async (req, res) => {
+    try {
+      const v = await verifierColisReception((req.body || {}).tnd);
+      if (v.erreur) return res.json(v.erreur);
+      const choix = await choisirEmplacement(v.colis);
+      if (!choix) return res.json({ ok: false, error: 'boutique_pleine' });
+      res.json({ ok: true, case: choix.case, meme_client: choix.meme_client, colis: ficheColis(Object.assign({}, v.colis, { case_congo: choix.case })) });
+    } catch (err) { erreurServeur(res, 'reception proposer', err); }
+  });
+
   app.post('/op/reception', requireOp, async (req, res) => {
     try {
       const b = req.body || {};
-      const laCase = String(b.case || '').trim().toUpperCase().replace(/[^A-Z0-9 \-·]/g, '').slice(0, 12);
-      if (!laCase) return res.json({ ok: false, error: 'case_requise' });
-      const c = await trouverColis(b.tnd);
-      if (!c) return res.json({ ok: false, error: 'colis_introuvable' });
-      if (['disponible', 'livre'].includes(c.statut)) return res.json({ ok: false, error: 'deja_scanne', statut_actuel: c.statut });
-      if (!['expedie', 'arrive'].includes(c.statut)) return res.json({ ok: false, error: 'pas_encore_expedie', statut_actuel: c.statut });
+      const scannee = normCase(b.case);
+      if (!scannee) return res.json({ ok: false, error: 'scan_emplacement_requis' });
+      const v = await verifierColisReception(b.tnd);
+      if (v.erreur) return res.json(v.erreur);
+      const c = v.colis;
+      const choix = await choisirEmplacement(c);
+      if (!choix) return res.json({ ok: false, error: 'boutique_pleine' });
+      if (scannee !== choix.case) {
+        await journal(req.op, 'reception_erreur_emplacement', c.tracking_interne, { attendu: choix.case, scanne: scannee });
+        return res.json({ ok: false, error: 'mauvais_emplacement', attendu: choix.case, scanne: scannee });
+      }
+      const laCase = choix.case;
       const { data, error } = await db.from('colis').update({ statut: 'disponible' }).eq('id', c.id).select().maybeSingle();
       if (error || !data) return res.json({ ok: false, error: 'update_failed' });
       const rCase = await db.from('colis').update({ case_congo: laCase }).eq('id', c.id);
@@ -287,7 +335,7 @@ module.exports = function brancherOperateur(app, o) {
       await noterEtapeTiinda(c.id, 'disponible');
       if (c.client_id) notifyColisStatus(c.client_id, data).catch(() => {});
       await journal(req.op, 'reception', c.tracking_interne, { case: laCase });
-      res.json({ ok: true, colis: ficheColis(Object.assign({}, c, { statut: 'disponible', case_congo: laCase, disponible_at: now(), jours: 0 })) });
+      res.json({ ok: true, meme_client: choix.meme_client, colis: ficheColis(Object.assign({}, c, { statut: 'disponible', case_congo: laCase, disponible_at: now(), jours: 0 })) });
     } catch (err) { erreurServeur(res, 'reception', err); }
   });
 
