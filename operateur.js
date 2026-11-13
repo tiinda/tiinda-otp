@@ -115,6 +115,14 @@ module.exports = function brancherOperateur(app, o) {
     const [y, m, d] = jourParis().split('-').map(Number);
     return new Date(Date.UTC(y, m - 1, d) - 3600000).toISOString();
   }
+  /* Début de la journée de caisse : la dernière clôture (on bascule sur la journée suivante dès qu'on clôture),
+     ou à défaut minuit (heure de Brazzaville). */
+  async function debutCaisse() {
+    const depuis = new Date(Date.now() - 45 * 86400000).toISOString();
+    const { data } = await db.from('caisse_clotures').select('created_at').gte('created_at', depuis).limit(500);
+    const derniere = (data || []).map((x) => x.created_at).filter(Boolean).sort().pop();
+    return derniere || debutJourBzv();
+  }
   async function journal(op, type, ref, detail) {
     try { await db.from('op_journal').insert({ operateur_id: op.id, type, ref, detail: detail || null }); }
     catch (e) { /* le journal ne doit jamais bloquer une opération */ }
@@ -359,7 +367,7 @@ module.exports = function brancherOperateur(app, o) {
   /* Chiffres du jour pour le panneau de droite du comptoir. */
   app.get('/op/jour', requireOp, async (req, res) => {
     try {
-      const debut = debutJourBzv();
+      const debut = debutJourBzv(), caisse = await debutCaisse();
       const il7j = new Date(Date.now() - 7 * 86400000).toISOString();
       const nb = async (q) => { const r = await q; return r.error ? 0 : (r.count || 0); };
       const [remis, boutique, aRecevoir, relances, recharges, borne] = await Promise.all([
@@ -367,8 +375,8 @@ module.exports = function brancherOperateur(app, o) {
         nb(db.from('colis').select('id', { count: 'exact', head: true }).eq('statut', 'disponible')),
         nb(db.from('colis').select('id', { count: 'exact', head: true }).eq('statut', 'expedie')),
         db.from('colis').select(SELECT_COLIS.replace(', case_congo', '')).eq('statut', 'disponible').lt('disponible_at', il7j).order('disponible_at', { ascending: true }).limit(8),
-        db.from('recharges_operateur').select('montant_fcfa, statut').gte('created_at', debut).neq('statut', 'refuse'),
-        db.from('borne_depots').select('montant_fcfa').gte('depose_le', debut),
+        db.from('recharges_operateur').select('montant_fcfa, statut').gt('created_at', caisse).neq('statut', 'refuse'),
+        db.from('borne_depots').select('montant_fcfa').gt('depose_le', caisse),
       ]);
       const enc = (recharges.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0)
         + (borne.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
@@ -433,10 +441,10 @@ module.exports = function brancherOperateur(app, o) {
   /* Opérations du jour (recharges + borne) et total en caisse. */
   app.get('/op/caisse', requireOp, async (req, res) => {
     try {
-      const debut = debutJourBzv();
+      const debut = await debutCaisse();
       const [rc, br] = await Promise.all([
-        db.from('recharges_operateur').select('*').gte('created_at', debut).order('created_at', { ascending: false }),
-        db.from('borne_depots').select('place, montant_fcfa, depose_le, rendu_le, code_ticket').gte('depose_le', debut).order('depose_le', { ascending: false }),
+        db.from('recharges_operateur').select('*').gt('created_at', debut).order('created_at', { ascending: false }),
+        db.from('borne_depots').select('place, montant_fcfa, depose_le, rendu_le, code_ticket').gt('depose_le', debut).order('depose_le', { ascending: false }),
       ]);
       const recharges = (rc.data || []);
       const borne = (br.data || []);
@@ -448,18 +456,49 @@ module.exports = function brancherOperateur(app, o) {
       const ops = recharges.map((x) => ({ heure: x.created_at, type: 'recharge', libelle: (x.nom_client || masquerTel(x.telephone)), statut: x.statut, montant_fcfa: x.montant_fcfa, ref: x.numero, moyen: x.moyen_paiement || 'especes' }))
         .concat(borne.map((x) => ({ heure: x.depose_le, type: 'borne', libelle: 'Borne, place ' + x.place, statut: x.rendu_le ? 'rendu' : 'en_charge', montant_fcfa: x.montant_fcfa, ref: x.code_ticket })))
         .sort((a, b) => (a.heure < b.heure ? 1 : -1));
-      res.json({ ok: true, total_fcfa: totRc + totBr, especes_fcfa: totRc - totMobile + totBr, mobile_fcfa: totMobile, mobile_nb: mobiles.length, recharges: { nb: valides.length, total_fcfa: totRc }, borne: { nb: borne.length, total_fcfa: totBr }, operations: ops.slice(0, 60) });
+      res.json({ ok: true, depuis: debut, total_fcfa: totRc + totBr, especes_fcfa: totRc - totMobile + totBr, mobile_fcfa: totMobile, mobile_nb: mobiles.length, recharges: { nb: valides.length, total_fcfa: totRc }, borne: { nb: borne.length, total_fcfa: totBr }, operations: ops.slice(0, 60) });
     } catch (err) { erreurServeur(res, 'caisse', err); }
   });
+
+  /* Clôture : James est prévenu tout de suite, par e-mail (ADMIN_EMAIL) et par SMS (OP_ALERTE_TEL, ex. +33612345678).
+     L'agent peut toujours clôturer, même avec un écart. */
+  async function alerterCloture(op, c) {
+    const f = (n) => Math.round(Number(n || 0)).toLocaleString('fr-FR').replace(/\u202f|\u00a0/g, ' ');
+    const nom = op.nom || op.identifiant;
+    const etat = c.ecart === 0 ? 'caisse juste' : (c.ecart < 0 ? 'MANQUE ' + f(-c.ecart) + ' FCFA' : 'SURPLUS ' + f(c.ecart) + ' FCFA');
+    const texte = 'Tiinda Brazzaville : clôture de ' + nom + ', ' + etat + '. Attendu ' + f(c.attendu) + ' FCFA, compté ' + f(c.compte) + ' FCFA (fond ' + f(c.fond) + ').';
+    const tel = process.env.OP_ALERTE_TEL;
+    if (tel && process.env.TWILIO_SMS_FROM && twilio) {
+      try { await twilio.messages.create({ from: process.env.TWILIO_SMS_FROM, to: tel, body: texte }); } catch (e) { console.warn('SMS alerte clôture :', e.message); }
+    }
+    const mail = process.env.ADMIN_EMAIL, cle = process.env.RESEND_API_KEY;
+    if (mail && cle) {
+      const couleur = c.ecart === 0 ? '#0B7A4B' : '#B42318';
+      await fetch('https://api.resend.com/emails', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + cle, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: process.env.MAIL_FROM || 'Tiinda <noreply@tiinda.com>', to: mail,
+          subject: (c.ecart === 0 ? '' : '⚠ ') + 'Clôture de caisse Brazzaville : ' + etat + ' (' + nom + ')',
+          html: '<p>Clôture de caisse de <strong>' + nom + '</strong>, agence Brazzaville.</p>'
+            + '<table cellpadding="6" style="border-collapse:collapse;font-family:Arial,sans-serif">'
+            + '<tr><td>Fond de caisse</td><td align="right">' + f(c.fond) + ' FCFA</td></tr>'
+            + '<tr><td>Encaissé (attendu)</td><td align="right">' + f(c.attendu) + ' FCFA</td></tr>'
+            + '<tr><td>Espèces comptées</td><td align="right">' + f(c.compte) + ' FCFA</td></tr>'
+            + '<tr><td><strong>Écart</strong></td><td align="right" style="color:' + couleur + '"><strong>' + f(c.ecart) + ' FCFA</strong></td></tr></table>',
+        }),
+      });
+    }
+    return texte;
+  }
 
   /* Clôture : l'agent compte les espèces, le serveur compare au total attendu. */
   app.post('/op/cloture', requireOp, async (req, res) => {
     try {
       const b = req.body || {};
-      const debut = debutJourBzv();
+      const debut = await debutCaisse();
       const [rc, br] = await Promise.all([
-        db.from('recharges_operateur').select('*').gte('created_at', debut).neq('statut', 'refuse'),
-        db.from('borne_depots').select('montant_fcfa').gte('depose_le', debut),
+        db.from('recharges_operateur').select('*').gt('created_at', debut).neq('statut', 'refuse'),
+        db.from('borne_depots').select('montant_fcfa').gt('depose_le', debut),
       ]);
       /* Seules les espèces sont dans le tiroir : le Mobile Money est arrivé sur le compte. */
       const attendu = (rc.data || []).filter((x) => !x.moyen_paiement || x.moyen_paiement === 'especes').reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + (br.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
@@ -469,6 +508,7 @@ module.exports = function brancherOperateur(app, o) {
       const { data, error } = await db.from('caisse_clotures').insert({ operateur_id: req.op.id, jour: jourParis(), fond_fcfa: fond, attendu_fcfa: attendu, compte_fcfa: compte, ecart_fcfa: ecart }).select().single();
       if (error) return res.json({ ok: false, error: 'enregistrement_impossible' });
       await journal(req.op, 'cloture', jourParis(), { attendu, compte, ecart });
+      alerterCloture(req.op, { fond, attendu, compte, ecart }).catch((e) => console.warn('alerte clôture :', e.message));
       res.json({ ok: true, cloture: Object.assign({}, data, { operateur: req.op.nom || req.op.identifiant }) });
     } catch (err) { erreurServeur(res, 'cloture', err); }
   });
