@@ -452,7 +452,7 @@ module.exports = function brancherOperateur(app, o) {
   app.get('/admin/operateurs', requireAdmin, async (req, res) => {
     try {
       const { data } = await db.from('operateurs').select('id, identifiant, nom, agence, actif, active_le, derniere_connexion, activation_expire, created_at').order('created_at', { ascending: true });
-      res.json({ ok: true, operateurs: data || [] });
+      res.json({ ok: true, operateurs: (data || []).filter((o) => !String(o.identifiant).startsWith('supprime.')) });
     } catch (err) { erreurServeur(res, 'admin operateurs', err); }
   });
 
@@ -490,6 +490,27 @@ module.exports = function brancherOperateur(app, o) {
       await db.from('operateurs').update({ actif: !!(req.body || {}).actif }).eq('id', (req.body || {}).id);
       res.json({ ok: true });
     } catch (err) { erreurServeur(res, 'admin actif operateur', err); }
+  });
+
+  /* Supprimer un agent. Il faut renvoyer son identifiant exact (confirmation).
+     S'il a déjà fait des opérations, son compte est archivé : il disparaît de la
+     liste et ne peut plus se connecter, mais l'historique (recharges, borne,
+     clôtures, journal) reste lisible pour les contrôles. */
+  app.post('/admin/operateurs/supprimer', requireAdmin, async (req, res) => {
+    try {
+      const b = req.body || {};
+      const { data: op } = await db.from('operateurs').select('id, identifiant').eq('id', b.id).maybeSingle();
+      if (!op) return res.json({ ok: false, error: 'introuvable' });
+      if (String(b.confirmation || '').trim().toLowerCase() !== op.identifiant) return res.json({ ok: false, error: 'confirmation_incorrecte' });
+      const { error } = await db.from('operateurs').delete().eq('id', op.id);
+      if (!error) return res.json({ ok: true, archive: false });
+      const { error: e2 } = await db.from('operateurs').update({
+        actif: false, identifiant: 'supprime.' + op.id.slice(0, 8) + '.' + op.identifiant,
+        mdp_hash: null, totp_secret: null, totp_secret_tmp: null, activation_hash: null, activation_expire: null,
+      }).eq('id', op.id);
+      if (e2) return res.json({ ok: false, error: 'suppression_impossible' });
+      res.json({ ok: true, archive: true });
+    } catch (err) { erreurServeur(res, 'admin supprimer operateur', err); }
   });
 
   /* ── James : demandes de recharge ────────────────────────────────────── */
