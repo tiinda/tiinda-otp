@@ -42,6 +42,12 @@ module.exports = function brancherOperateur(app, o) {
   const now = () => new Date().toISOString();
   const rond2 = (n) => Math.round(Number(n || 0) * 100) / 100;
   const fcfaVersEur = (f) => rond2(Number(f || 0) / TAUX_FCFA);
+  /* Mêmes recharges que dans l'espace client (10 €, 20 € +5 %, 50 € +10 %).
+     Prix en FCFA = parité fixe 655,957, arrondi au 50 FCFA supérieur : Colispo ne perd jamais sur la conversion. */
+  const PACKS = [{ eur: 10, bonus: 0 }, { eur: 20, bonus: 0.05 }, { eur: 50, bonus: 0.10 }]
+    .map((p) => Object.assign(p, { fcfa: Math.ceil((p.eur * TAUX_FCFA) / 50) * 50, credit: rond2(p.eur * (1 + p.bonus)) }));
+  /* Montant libre : conversion arrondie au centime inférieur (jamais en faveur d'une perte). */
+  const creditPourFcfa = (f) => { const p = PACKS.find((x) => x.fcfa === f); return p ? { eur: p.credit, bonus_eur: rond2(p.credit - p.eur), pack: p.eur } : { eur: Math.floor((Number(f || 0) / TAUX_FCFA) * 100) / 100, bonus_eur: 0, pack: null }; };
 
   function signer(prefixe, obj, dureeMs) {
     const payload = b64url(JSON.stringify(Object.assign({}, obj, { exp: Date.now() + dureeMs })));
@@ -300,6 +306,7 @@ module.exports = function brancherOperateur(app, o) {
   }
   const normCase = (v) => String(v || '').trim().toUpperCase().replace(/^EMP[-\s]?/, '').replace(/[^A-Z0-9]/g, '').slice(0, 12);
 
+  app.get('/op/packs', requireOp, (req, res) => res.json({ ok: true, taux: TAUX_FCFA, packs: PACKS }));
   app.get('/op/emplacements', requireOp, (req, res) => res.json({ ok: true, etageres: ETAGERES, cases_par_etagere: CASES_PAR_ETAGERE, emplacements: EMPLACEMENTS }));
 
   app.post('/op/reception/proposer', requireOp, async (req, res) => {
@@ -402,13 +409,13 @@ module.exports = function brancherOperateur(app, o) {
       const ligne = {
         numero: await numeroRecu('RCH', 'recharges_operateur', 'created_at'),
         operateur_id: req.op.id, client_id: cli ? cli.id : null, telephone: tel, nom_client: nom || null,
-        montant_fcfa: montant, montant_eur: fcfaVersEur(montant), especes_recues: especes, monnaie_rendue: especes - montant,
+        montant_fcfa: montant, montant_eur: creditPourFcfa(montant).eur, especes_recues: especes, monnaie_rendue: especes - montant,
         statut: 'attente',
       };
       const { data, error } = await db.from('recharges_operateur').insert(ligne).select().single();
       if (error) { console.error('op recharge insert:', error.message); return res.json({ ok: false, error: 'enregistrement_impossible' }); }
       await journal(req.op, 'recharge', data.numero, { montant_fcfa: montant });
-      res.json({ ok: true, recu: Object.assign({}, data, { telephone_masque: masquerTel(tel), operateur: req.op.nom || req.op.identifiant, client_connu: !!cli }) });
+      res.json({ ok: true, recu: Object.assign({}, data, { bonus_eur: creditPourFcfa(montant).bonus_eur, telephone_masque: masquerTel(tel), operateur: req.op.nom || req.op.identifiant, client_connu: !!cli }) });
     } catch (err) { erreurServeur(res, 'recharge', err); }
   });
 
