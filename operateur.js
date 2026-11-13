@@ -703,4 +703,3 @@ module.exports = function brancherOperateur(app, o) {
 
   console.log('Espace opérateur Brazzaville : routes /op/* branchées');
 };
-};
