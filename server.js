@@ -372,7 +372,7 @@ app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (originAllowed(origin)) { res.header('Access-Control-Allow-Origin', origin); res.header('Vary', 'Origin'); }
   res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-token, x-admin-session, x-scan-token');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-token, x-admin-session, x-scan-token, x-op-session');
   res.header('Access-Control-Max-Age', '86400');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -2874,6 +2874,8 @@ app.post('/wallet/redeem', requireAuth, async (req, res) => {
     const { data: rc } = await db.from('recharge_codes').select('*').eq('code', code).limit(1).maybeSingle();
     if (!rc) return res.json({ ok: false, error: 'code_invalide' });
     if (rc.used) return res.json({ ok: false, error: 'code_deja_utilise' });
+    // Code vendu au guichet de Brazzaville : réservé au numéro du client qui l'a payé.
+    if (rc.reserve_tel && rc.reserve_tel !== phone) return res.json({ ok: false, error: 'code_invalide' });
     // Marque le code utilisé puis crédite.
     // Marque le code SEULEMENT s'il est encore libre : deux clics simultanés
     // ne peuvent plus le consommer deux fois.
@@ -3404,6 +3406,12 @@ app.get('/admin/ecran', requireAdmin, async (req, res) => {
     console.error('admin ecran error:', err.message);
     res.status(500).json({ ok: false, error: 'server_error' });
   }
+});
+
+/* ── Espace opérateur de l'agence de Brazzaville (routes /op/*) ─────────── */
+require('./operateur')(app, {
+  db, twilio: client, rateLimit, clientIp, b64url, SESSION_KEY, base32Decode, totpCode,
+  requireAdmin, notifyColisStatus, noterEtapeTiinda, hashPassword, verifyPassword,
 });
 
 app.listen(PORT, () => {
