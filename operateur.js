@@ -438,6 +438,23 @@ module.exports = function brancherOperateur(app, o) {
     } catch (err) { erreurServeur(res, 'recharge', err); }
   });
 
+  /* Vérifier un reçu de recharge (scan du code-barres RCH-…) : le code a-t-il été envoyé au client, et utilisé ?
+     Le code lui-même n'est jamais montré à l'agent. */
+  app.get('/op/recu', requireOp, async (req, res) => {
+    try {
+      const n = String(req.query.n || '').trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
+      if (!/^RCH-/.test(n)) return res.json({ ok: false, error: 'recu_introuvable' });
+      const { data: d } = await db.from('recharges_operateur').select('*').eq('numero', n).maybeSingle();
+      if (!d) return res.json({ ok: false, error: 'recu_introuvable' });
+      let utilise = false, utilise_le = null;
+      if (d.code) {
+        const { data: rc } = await db.from('recharge_codes').select('used, used_at').eq('code', d.code).maybeSingle();
+        if (rc) { utilise = !!rc.used; utilise_le = rc.used_at || null; }
+      }
+      res.json({ ok: true, recu: { numero: d.numero, statut: d.statut, montant_fcfa: d.montant_fcfa, montant_eur: d.montant_eur, nom_client: d.nom_client, telephone_masque: masquerTel(d.telephone), cree_le: d.created_at, envoye_le: d.envoye_le || null, message_parti: d.sms_ok !== false, motif_refus: d.motif_refus || null, utilise, utilise_le } });
+    } catch (err) { erreurServeur(res, 'recu', err); }
+  });
+
   /* Opérations du jour (recharges + borne) et total en caisse. */
   app.get('/op/caisse', requireOp, async (req, res) => {
     try {
@@ -685,4 +702,5 @@ module.exports = function brancherOperateur(app, o) {
   });
 
   console.log('Espace opérateur Brazzaville : routes /op/* branchées');
+};
 };
