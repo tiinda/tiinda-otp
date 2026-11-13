@@ -653,13 +653,25 @@ module.exports = function brancherOperateur(app, o) {
       const montantTxt = Number(dem.montant_eur).toFixed(2).replace('.', ',') + ' €';
       const texte = 'Tiinda : votre code de recharge de ' + montantTxt + ' est ' + code
         + '. Saisissez-le dans votre espace sur tiinda.com (Mon solde). Reçu ' + dem.numero + '.';
-      let smsOk = false, smsErreur = null;
-      if (process.env.TWILIO_SMS_FROM) {
-        try { await twilio.messages.create({ from: process.env.TWILIO_SMS_FROM, to: dem.telephone, body: texte }); smsOk = true; }
-        catch (e) { smsErreur = e.message; console.error('sms recharge op:', e.message); }
-      } else smsErreur = 'TWILIO_SMS_FROM non configuré';
+      /* Envoi par WhatsApp d'abord (modèle approuvé TWILIO_WA_RECHARGE_SID, 3 variables : montant, code, n° de reçu),
+         sinon par SMS. */
+      let smsOk = false, smsErreur = null, canal = null;
+      if (process.env.TWILIO_WHATSAPP_FROM && process.env.TWILIO_WA_RECHARGE_SID) {
+        try {
+          await twilio.messages.create({
+            from: 'whatsapp:' + process.env.TWILIO_WHATSAPP_FROM, to: 'whatsapp:' + dem.telephone,
+            contentSid: process.env.TWILIO_WA_RECHARGE_SID,
+            contentVariables: JSON.stringify({ '1': montantTxt, '2': code, '3': dem.numero }),
+          });
+          smsOk = true; canal = 'whatsapp';
+        } catch (e) { smsErreur = 'WhatsApp : ' + e.message; console.error('whatsapp recharge op:', e.message); }
+      }
+      if (!smsOk && process.env.TWILIO_SMS_FROM) {
+        try { await twilio.messages.create({ from: process.env.TWILIO_SMS_FROM, to: dem.telephone, body: texte }); smsOk = true; canal = 'sms'; }
+        catch (e) { smsErreur = (smsErreur ? smsErreur + ' ; ' : '') + 'SMS : ' + e.message; console.error('sms recharge op:', e.message); }
+      } else if (!smsOk && !smsErreur) smsErreur = 'ni WhatsApp ni SMS configurés';
       await db.from('recharges_operateur').update({ statut: 'envoye', code, envoye_le: now(), sms_ok: smsOk }).eq('id', id);
-      res.json({ ok: true, code, sms_ok: smsOk, sms_erreur: smsErreur, texte });
+      res.json({ ok: true, code, sms_ok: smsOk, canal, sms_erreur: smsErreur, texte, telephone: dem.telephone });
     } catch (err) { erreurServeur(res, 'admin envoyer recharge', err); }
   });
 
