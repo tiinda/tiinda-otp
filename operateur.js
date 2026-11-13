@@ -42,12 +42,12 @@ module.exports = function brancherOperateur(app, o) {
   const now = () => new Date().toISOString();
   const rond2 = (n) => Math.round(Number(n || 0) * 100) / 100;
   const fcfaVersEur = (f) => rond2(Number(f || 0) / TAUX_FCFA);
-  /* Mêmes recharges que dans l'espace client (10 €, 20 € +5 %, 50 € +10 %).
+  /* Recharges proposées à l'agence : 10, 20 et 50 € (sans bonus : le bonus est réservé aux achats en ligne).
      Prix en FCFA = parité fixe 655,957, arrondi au 50 FCFA supérieur : Colispo ne perd jamais sur la conversion. */
-  const PACKS = [{ eur: 10, bonus: 0 }, { eur: 20, bonus: 0.05 }, { eur: 50, bonus: 0.10 }]
-    .map((p) => Object.assign(p, { fcfa: Math.ceil((p.eur * TAUX_FCFA) / 50) * 50, credit: rond2(p.eur * (1 + p.bonus)) }));
-  /* Montant libre : conversion arrondie au centime inférieur (jamais en faveur d'une perte). */
-  const creditPourFcfa = (f) => { const p = PACKS.find((x) => x.fcfa === f); return p ? { eur: p.credit, bonus_eur: rond2(p.credit - p.eur), pack: p.eur } : { eur: Math.floor((Number(f || 0) / TAUX_FCFA) * 100) / 100, bonus_eur: 0, pack: null }; };
+  const PACKS = [10, 20, 50].map((eur) => ({ eur, fcfa: Math.ceil((eur * TAUX_FCFA) / 50) * 50 }));
+  /* Crédit donné au client : la valeur du pack, ou pour un montant libre la conversion arrondie au centime inférieur. */
+  const creditPourFcfa = (f) => { const p = PACKS.find((x) => x.fcfa === f); return p ? p.eur : Math.floor((Number(f || 0) / TAUX_FCFA) * 100) / 100; };
+  const MOYENS = { especes: 'Espèces', mtn: 'MTN Mobile Money', airtel: 'Airtel Money' };
 
   function signer(prefixe, obj, dureeMs) {
     const payload = b64url(JSON.stringify(Object.assign({}, obj, { exp: Date.now() + dureeMs })));
@@ -306,7 +306,7 @@ module.exports = function brancherOperateur(app, o) {
   }
   const normCase = (v) => String(v || '').trim().toUpperCase().replace(/^EMP[-\s]?/, '').replace(/[^A-Z0-9]/g, '').slice(0, 12);
 
-  app.get('/op/packs', requireOp, (req, res) => res.json({ ok: true, taux: TAUX_FCFA, packs: PACKS }));
+  app.get('/op/packs', requireOp, (req, res) => res.json({ ok: true, taux: TAUX_FCFA, packs: PACKS, moyens: MOYENS }));
   app.get('/op/emplacements', requireOp, (req, res) => res.json({ ok: true, etageres: ETAGERES, cases_par_etagere: CASES_PAR_ETAGERE, emplacements: EMPLACEMENTS }));
 
   app.post('/op/reception/proposer', requireOp, async (req, res) => {
@@ -399,23 +399,34 @@ module.exports = function brancherOperateur(app, o) {
       const b = req.body || {};
       const tel = normTel(b.telephone);
       const montant = Math.round(Number(b.montant_fcfa || 0));
-      const especes = Math.round(Number(b.especes_recues || 0));
+      const moyen = MOYENS[b.moyen] ? b.moyen : 'especes';
+      const refPaiement = String(b.reference || '').trim().replace(/[^A-Za-z0-9.\-_ ]/g, '').slice(0, 40);
+      const especes = moyen === 'especes' ? Math.round(Number(b.especes_recues || 0)) : Math.round(Number(b.montant_fcfa || 0));
       if (!tel || tel.length < 10) return res.json({ ok: false, error: 'tel_invalide' });
       if (!(montant >= 500)) return res.json({ ok: false, error: 'montant_trop_petit' });
       if (montant > 2000000) return res.json({ ok: false, error: 'montant_trop_grand' });
-      if (especes < montant) return res.json({ ok: false, error: 'especes_insuffisantes' });
+      if (moyen === 'especes' && especes < montant) return res.json({ ok: false, error: 'especes_insuffisantes' });
+      if (moyen !== 'especes' && refPaiement.length < 4) return res.json({ ok: false, error: 'reference_requise' });
       const { data: cli } = await db.from('clients').select('id, prenom, nom').eq('phone', tel).maybeSingle();
       const nom = cli ? [cli.prenom, cli.nom ? String(cli.nom).charAt(0) + '.' : ''].filter(Boolean).join(' ') : String(b.nom || '').trim().slice(0, 60);
       const ligne = {
         numero: await numeroRecu('RCH', 'recharges_operateur', 'created_at'),
         operateur_id: req.op.id, client_id: cli ? cli.id : null, telephone: tel, nom_client: nom || null,
-        montant_fcfa: montant, montant_eur: creditPourFcfa(montant).eur, especes_recues: especes, monnaie_rendue: especes - montant,
+        montant_fcfa: montant, montant_eur: creditPourFcfa(montant), especes_recues: especes, monnaie_rendue: especes - montant,
         statut: 'attente',
       };
-      const { data, error } = await db.from('recharges_operateur').insert(ligne).select().single();
+      /* Moyen de paiement : prévu pour plus tard (colonnes Supabase à créer). Pour l'instant tout est en espèces. */
+      if (moyen !== 'especes') { ligne.moyen_paiement = moyen; ligne.ref_paiement = refPaiement || null; }
+      let { data, error } = await db.from('recharges_operateur').insert(ligne).select().single();
+      if (error && /moyen_paiement|ref_paiement/.test(error.message || '')) {
+        /* Colonnes pas encore créées dans Supabase : on enregistre quand même (espèces seulement). */
+        if (moyen !== 'especes') return res.json({ ok: false, error: 'mobile_money_pas_active' });
+        delete ligne.moyen_paiement; delete ligne.ref_paiement;
+        ({ data, error } = await db.from('recharges_operateur').insert(ligne).select().single());
+      }
       if (error) { console.error('op recharge insert:', error.message); return res.json({ ok: false, error: 'enregistrement_impossible' }); }
-      await journal(req.op, 'recharge', data.numero, { montant_fcfa: montant });
-      res.json({ ok: true, recu: Object.assign({}, data, { bonus_eur: creditPourFcfa(montant).bonus_eur, telephone_masque: masquerTel(tel), operateur: req.op.nom || req.op.identifiant, client_connu: !!cli }) });
+      await journal(req.op, 'recharge', data.numero, { montant_fcfa: montant, moyen });
+      res.json({ ok: true, recu: Object.assign({}, data, { moyen_paiement: moyen, ref_paiement: refPaiement || null, moyen_libelle: MOYENS[moyen], telephone_masque: masquerTel(tel), operateur: req.op.nom || req.op.identifiant, client_connu: !!cli }) });
     } catch (err) { erreurServeur(res, 'recharge', err); }
   });
 
@@ -424,17 +435,20 @@ module.exports = function brancherOperateur(app, o) {
     try {
       const debut = debutJourBzv();
       const [rc, br] = await Promise.all([
-        db.from('recharges_operateur').select('numero, nom_client, telephone, montant_fcfa, montant_eur, statut, created_at').gte('created_at', debut).order('created_at', { ascending: false }),
+        db.from('recharges_operateur').select('*').gte('created_at', debut).order('created_at', { ascending: false }),
         db.from('borne_depots').select('place, montant_fcfa, depose_le, rendu_le, code_ticket').gte('depose_le', debut).order('depose_le', { ascending: false }),
       ]);
       const recharges = (rc.data || []);
       const borne = (br.data || []);
-      const totRc = recharges.filter((x) => x.statut !== 'refuse').reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
+      const valides = recharges.filter((x) => x.statut !== 'refuse');
+      const totRc = valides.reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
+      const mobiles = valides.filter((x) => x.moyen_paiement && x.moyen_paiement !== 'especes');
+      const totMobile = mobiles.reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
       const totBr = borne.reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
-      const ops = recharges.map((x) => ({ heure: x.created_at, type: 'recharge', libelle: (x.nom_client || masquerTel(x.telephone)), statut: x.statut, montant_fcfa: x.montant_fcfa, ref: x.numero }))
+      const ops = recharges.map((x) => ({ heure: x.created_at, type: 'recharge', libelle: (x.nom_client || masquerTel(x.telephone)), statut: x.statut, montant_fcfa: x.montant_fcfa, ref: x.numero, moyen: x.moyen_paiement || 'especes' }))
         .concat(borne.map((x) => ({ heure: x.depose_le, type: 'borne', libelle: 'Borne, place ' + x.place, statut: x.rendu_le ? 'rendu' : 'en_charge', montant_fcfa: x.montant_fcfa, ref: x.code_ticket })))
         .sort((a, b) => (a.heure < b.heure ? 1 : -1));
-      res.json({ ok: true, total_fcfa: totRc + totBr, recharges: { nb: recharges.filter((x) => x.statut !== 'refuse').length, total_fcfa: totRc }, borne: { nb: borne.length, total_fcfa: totBr }, operations: ops.slice(0, 60) });
+      res.json({ ok: true, total_fcfa: totRc + totBr, especes_fcfa: totRc - totMobile + totBr, mobile_fcfa: totMobile, mobile_nb: mobiles.length, recharges: { nb: valides.length, total_fcfa: totRc }, borne: { nb: borne.length, total_fcfa: totBr }, operations: ops.slice(0, 60) });
     } catch (err) { erreurServeur(res, 'caisse', err); }
   });
 
@@ -444,10 +458,11 @@ module.exports = function brancherOperateur(app, o) {
       const b = req.body || {};
       const debut = debutJourBzv();
       const [rc, br] = await Promise.all([
-        db.from('recharges_operateur').select('montant_fcfa').gte('created_at', debut).neq('statut', 'refuse'),
+        db.from('recharges_operateur').select('*').gte('created_at', debut).neq('statut', 'refuse'),
         db.from('borne_depots').select('montant_fcfa').gte('depose_le', debut),
       ]);
-      const attendu = (rc.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + (br.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
+      /* Seules les espèces sont dans le tiroir : le Mobile Money est arrivé sur le compte. */
+      const attendu = (rc.data || []).filter((x) => !x.moyen_paiement || x.moyen_paiement === 'especes').reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + (br.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
       const fond = Math.round(Number(b.fond_fcfa || 0));
       const compte = Math.round(Number(b.especes_comptees || 0));
       const ecart = compte - fond - attendu;
