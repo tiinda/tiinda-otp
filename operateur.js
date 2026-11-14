@@ -393,7 +393,7 @@ module.exports = function brancherOperateur(app, o) {
       const debutSem = new Date(lundi).toISOString(), debut = debutJourBzv();
       const il7j = new Date(Date.now() - 7 * 86400000).toISOString();
       const nb = async (q) => { const r = await q; return r.error ? 0 : (r.count || 0); };
-      const [rc, br, livres, nouveaux, relances, attente, aRecevoir] = await Promise.all([
+      const [rc, br, livres, nouveaux, relances, attente, aRecevoir, rangement, borneOcc] = await Promise.all([
         db.from('recharges_operateur').select('client_id, telephone, montant_fcfa, statut, created_at').gte('created_at', debutSem),
         db.from('borne_depots').select('montant_fcfa, depose_le').gte('depose_le', debutSem),
         db.from('colis').select('client_id').eq('statut', 'livre').gte('livre_at', debut),
@@ -401,7 +401,10 @@ module.exports = function brancherOperateur(app, o) {
         nb(db.from('colis').select('id', { count: 'exact', head: true }).eq('statut', 'disponible').lt('disponible_at', il7j)),
         nb(db.from('recharges_operateur').select('id', { count: 'exact', head: true }).eq('statut', 'attente')),
         nb(db.from('colis').select('id', { count: 'exact', head: true }).eq('statut', 'expedie')),
+        db.from('colis').select('case_congo').eq('statut', 'disponible').limit(5000),
+        nb(db.from('borne_depots').select('id', { count: 'exact', head: true }).is('rendu_le', null)),
       ]);
+      const casesPrises = new Set((rangement.data || []).map((x) => x.case_congo).filter((c) => c && EMPLACEMENTS.includes(c)));
       const recharges = (rc.data || []).filter((x) => x.statut !== 'refuse'), borne = br.data || [];
       const semaine = [0, 0, 0, 0, 0, 0, 0];
       const jourIdx = (iso) => Math.floor((new Date(iso).getTime() - lundi) / 86400000);
@@ -416,6 +419,7 @@ module.exports = function brancherOperateur(app, o) {
         clients_jour: clients.size, nouveaux_clients: nouveaux,
         operations_jour: rcJour.length + brJour.length + (livres.data || []).length,
         alertes: { a_receptionner: aRecevoir, colis_plus_7j: relances, recharges_attente: attente },
+        libres: { borne: Math.max(0, NB_PLACES_BORNE - borneOcc), borne_total: NB_PLACES_BORNE, rangement: EMPLACEMENTS.length - casesPrises.size, rangement_total: EMPLACEMENTS.length },
       });
     } catch (err) { erreurServeur(res, 'tableau', err); }
   });
