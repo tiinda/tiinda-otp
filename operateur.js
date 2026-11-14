@@ -483,7 +483,7 @@ module.exports = function brancherOperateur(app, o) {
     const f = (n) => Math.round(Number(n || 0)).toLocaleString('fr-FR').replace(/\u202f|\u00a0/g, ' ');
     const nom = op.nom || op.identifiant;
     const etat = c.ecart === 0 ? 'caisse juste' : (c.ecart < 0 ? 'MANQUE ' + f(-c.ecart) + ' FCFA' : 'SURPLUS ' + f(c.ecart) + ' FCFA');
-    const texte = 'Tiinda Brazzaville : clôture de ' + nom + ', ' + etat + '. Attendu ' + f(c.attendu) + ' FCFA, compté ' + f(c.compte) + ' FCFA (fond ' + f(c.fond) + ').';
+    const texte = 'Tiinda Brazzaville : clôture de ' + nom + ', ' + etat + '. Attendu ' + f(c.attendu) + ' FCFA, compté ' + f(c.compte) + ' FCFA (fond ' + f(c.fond) + '). Banque : ' + f(c.banque) + ' FCFA.';
     const tel = process.env.OP_ALERTE_TEL;
     if (tel && process.env.TWILIO_SMS_FROM && twilio) {
       try { await twilio.messages.create({ from: process.env.TWILIO_SMS_FROM, to: tel, body: texte }); } catch (e) { console.warn('SMS alerte clôture :', e.message); }
@@ -501,7 +501,8 @@ module.exports = function brancherOperateur(app, o) {
             + '<tr><td>Fond de caisse</td><td align="right">' + f(c.fond) + ' FCFA</td></tr>'
             + '<tr><td>Encaissé (attendu)</td><td align="right">' + f(c.attendu) + ' FCFA</td></tr>'
             + '<tr><td>Espèces comptées</td><td align="right">' + f(c.compte) + ' FCFA</td></tr>'
-            + '<tr><td><strong>Écart</strong></td><td align="right" style="color:' + couleur + '"><strong>' + f(c.ecart) + ' FCFA</strong></td></tr></table>',
+            + '<tr><td><strong>Écart</strong></td><td align="right" style="color:' + couleur + '"><strong>' + f(c.ecart) + ' FCFA</strong></td></tr>'
+            + '<tr><td>Solde en banque (Congo)</td><td align="right"><strong>' + f(c.banque) + ' FCFA</strong><br><span style="font-size:11px;color:#9AA3B8">soit ' + (Number(c.banque || 0) / TAUX_FCFA).toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, ' ') + ' €</span></td></tr></table>',
         }),
       });
     }
@@ -522,10 +523,21 @@ module.exports = function brancherOperateur(app, o) {
       const fond = Math.round(Number(b.fond_fcfa || 0));
       const compte = Math.round(Number(b.especes_comptees || 0));
       const ecart = compte - fond - attendu;
-      const { data, error } = await db.from('caisse_clotures').insert({ operateur_id: req.op.id, jour: jourParis(), fond_fcfa: fond, attendu_fcfa: attendu, compte_fcfa: compte, ecart_fcfa: ecart }).select().single();
+      /* Solde du compte bancaire au Congo, renseigné chaque soir par l'agent (obligatoire). */
+      if (b.solde_banque === undefined || b.solde_banque === null || String(b.solde_banque).trim() === '') return res.json({ ok: false, error: 'solde_banque_requis' });
+      const banque = Math.round(Number(b.solde_banque));
+      if (!Number.isFinite(banque) || banque < 0) return res.json({ ok: false, error: 'solde_banque_requis' });
+      const ligne = { operateur_id: req.op.id, jour: jourParis(), fond_fcfa: fond, attendu_fcfa: attendu, compte_fcfa: compte, ecart_fcfa: ecart, solde_banque_fcfa: banque };
+      let { data, error } = await db.from('caisse_clotures').insert(ligne).select().single();
+      if (error && /solde_banque/.test(error.message || '')) {
+        /* Colonne pas encore créée dans Supabase : on garde la clôture, le solde reste dans le journal et l'alerte. */
+        delete ligne.solde_banque_fcfa;
+        ({ data, error } = await db.from('caisse_clotures').insert(ligne).select().single());
+        if (data) data.solde_banque_fcfa = banque;
+      }
       if (error) return res.json({ ok: false, error: 'enregistrement_impossible' });
-      await journal(req.op, 'cloture', jourParis(), { attendu, compte, ecart });
-      alerterCloture(req.op, { fond, attendu, compte, ecart }).catch((e) => console.warn('alerte clôture :', e.message));
+      await journal(req.op, 'cloture', jourParis(), { attendu, compte, ecart, banque });
+      alerterCloture(req.op, { fond, attendu, compte, ecart, banque }).catch((e) => console.warn('alerte clôture :', e.message));
       res.json({ ok: true, cloture: Object.assign({}, data, { operateur: req.op.nom || req.op.identifiant }) });
     } catch (err) { erreurServeur(res, 'cloture', err); }
   });
