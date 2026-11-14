@@ -384,6 +384,42 @@ module.exports = function brancherOperateur(app, o) {
     } catch (err) { erreurServeur(res, 'jour', err); }
   });
 
+  /* Indicateurs du tableau de bord : clients du jour, opérations, activité de la semaine, alertes. */
+  app.get('/op/tableau', requireOp, async (req, res) => {
+    try {
+      const [y, m, d] = jourParis().split('-').map(Number);
+      const dow = (new Date(Date.UTC(y, m - 1, d)).getUTCDay() + 6) % 7; // 0 = lundi
+      const lundi = Date.UTC(y, m - 1, d - dow) - 3600000;
+      const debutSem = new Date(lundi).toISOString(), debut = debutJourBzv();
+      const il7j = new Date(Date.now() - 7 * 86400000).toISOString();
+      const nb = async (q) => { const r = await q; return r.error ? 0 : (r.count || 0); };
+      const [rc, br, livres, nouveaux, relances, attente, aRecevoir] = await Promise.all([
+        db.from('recharges_operateur').select('client_id, telephone, montant_fcfa, statut, created_at').gte('created_at', debutSem),
+        db.from('borne_depots').select('montant_fcfa, depose_le').gte('depose_le', debutSem),
+        db.from('colis').select('client_id').eq('statut', 'livre').gte('livre_at', debut),
+        nb(db.from('clients').select('id', { count: 'exact', head: true }).gte('created_at', debut)),
+        nb(db.from('colis').select('id', { count: 'exact', head: true }).eq('statut', 'disponible').lt('disponible_at', il7j)),
+        nb(db.from('recharges_operateur').select('id', { count: 'exact', head: true }).eq('statut', 'attente')),
+        nb(db.from('colis').select('id', { count: 'exact', head: true }).eq('statut', 'expedie')),
+      ]);
+      const recharges = (rc.data || []).filter((x) => x.statut !== 'refuse'), borne = br.data || [];
+      const semaine = [0, 0, 0, 0, 0, 0, 0];
+      const jourIdx = (iso) => Math.floor((new Date(iso).getTime() - lundi) / 86400000);
+      recharges.forEach((x) => { const i = jourIdx(x.created_at); if (i >= 0 && i < 7) semaine[i] += Number(x.montant_fcfa || 0); });
+      borne.forEach((x) => { const i = jourIdx(x.depose_le); if (i >= 0 && i < 7) semaine[i] += Number(x.montant_fcfa || 0); });
+      const rcJour = recharges.filter((x) => x.created_at >= debut), brJour = borne.filter((x) => x.depose_le >= debut);
+      const clients = new Set();
+      rcJour.forEach((x) => clients.add(x.client_id || 'tel:' + x.telephone));
+      (livres.data || []).forEach((x) => { if (x.client_id) clients.add(x.client_id); });
+      res.json({
+        ok: true, jour_semaine: dow, semaine_fcfa: semaine,
+        clients_jour: clients.size, nouveaux_clients: nouveaux,
+        operations_jour: rcJour.length + brJour.length + (livres.data || []).length,
+        alertes: { a_receptionner: aRecevoir, colis_plus_7j: relances, recharges_attente: attente },
+      });
+    } catch (err) { erreurServeur(res, 'tableau', err); }
+  });
+
   /* ── Caisse : recharge de solde ──────────────────────────────────────── */
   app.get('/op/client', requireOp, async (req, res) => {
     try {
