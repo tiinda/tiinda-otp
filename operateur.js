@@ -881,6 +881,26 @@ module.exports = function brancherOperateur(app, o) {
     } catch (err) { erreurServeur(res, 'admin badge', err); }
   });
 
+
+  /* Activité du jour, vue par l'administrateur (tableau de bord admin). */
+  app.get('/admin/activite', requireAdmin, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      const debut = debutJourBzv();
+      const [rc, br, lv] = await Promise.all([
+        db.from('recharges_operateur').select('client_id, telephone, montant_fcfa, statut').gte('created_at', debut),
+        db.from('borne_depots').select('montant_fcfa').gte('depose_le', debut),
+        db.from('colis').select('client_id').eq('statut', 'livre').gte('livre_at', debut),
+      ]);
+      const recharges = (rc.data || []).filter((x) => x.statut !== 'refuse'), borne = br.data || [], livres = lv.data || [];
+      const somme = (l) => l.reduce((t, x) => t + Number(x.montant_fcfa || 0), 0);
+      res.json({ ok: true,
+        recharges: recharges.length, recharges_fcfa: somme(recharges),
+        borne: borne.length, borne_fcfa: somme(borne), colis_livres: livres.length,
+        operations: recharges.length + borne.length + livres.length });
+    } catch (err) { erreurServeur(res, 'admin activite', err); }
+  });
+
   /* Départ : l'agent se déconnecte. */
   app.post('/op/deconnexion', requireOp, async (req, res) => {
     await noterPresence(req.op, 'depart');
