@@ -12,9 +12,10 @@
 
    Routes agent (en-tête x-op-session)
      POST /op/login, /op/code, /op/activation/debut, /op/activation/fin
-     GET  /op/moi, /op/jour, /op/colis, /op/boutique, /op/client, /op/caisse, /op/borne
+     GET  /op/moi, /op/jour, /op/colis, /op/boutique, /op/client, /op/caisse, /op/borne, /op/station
      POST /op/remise, /op/reception, /op/recharge, /op/borne/depot,
-          /op/borne/rendre, /op/cloture
+          /op/borne/rendre, /op/cloture, /op/station/depot, /op/station/debrancher,
+          /op/station/retrait/verifier, /op/station/retrait
 
    Routes James (session admin)
      GET  /admin/operateurs, /admin/recharges-op
@@ -402,7 +403,7 @@ module.exports = function brancherOperateur(app, o) {
         db.from('borne_depots').select('montant_fcfa').gt('depose_le', caisse),
       ]);
       const enc = (recharges.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0)
-        + (borne.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
+        + (borne.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + sommeGardes(await gardesBorne(caisse));
       res.json({ ok: true, remis, en_boutique: boutique, a_recevoir: aRecevoir, encaisse_fcfa: enc, relances: (relances.data || []).map(ficheColis) });
     } catch (err) { erreurServeur(res, 'jour', err); }
   });
@@ -425,14 +426,16 @@ module.exports = function brancherOperateur(app, o) {
         nb(db.from('recharges_operateur').select('id', { count: 'exact', head: true }).eq('statut', 'attente')),
         nb(db.from('colis').select('id', { count: 'exact', head: true }).eq('statut', 'expedie')),
         db.from('colis').select('case_congo').eq('statut', 'disponible').limit(5000),
-        nb(db.from('borne_depots').select('id', { count: 'exact', head: true }).is('rendu_le', null)),
+        nb(db.from('borne_depots').select('id', { count: 'exact', head: true }).is('rendu_le', null).is('debranche_le', null)),
       ]);
+      const cfgB = await cfgBorne(), gardesSem = await gardesBorne(debutSem, true);
       const casesPrises = new Set((rangement.data || []).map((x) => x.case_congo).filter((c) => c && EMPLACEMENTS.includes(c)));
       const recharges = (rc.data || []).filter((x) => x.statut !== 'refuse'), borne = br.data || [];
       const semaine = [0, 0, 0, 0, 0, 0, 0];
       const jourIdx = (iso) => Math.floor((new Date(iso).getTime() - lundi) / 86400000);
       recharges.forEach((x) => { const i = jourIdx(x.created_at); if (i >= 0 && i < 7) semaine[i] += Number(x.montant_fcfa || 0); });
       borne.forEach((x) => { const i = jourIdx(x.depose_le); if (i >= 0 && i < 7) semaine[i] += Number(x.montant_fcfa || 0); });
+      gardesSem.forEach((x) => { const i = jourIdx(x.rendu_le); if (i >= 0 && i < 7) semaine[i] += Number(x.garde_fcfa || 0); });
       const rcJour = recharges.filter((x) => x.created_at >= debut), brJour = borne.filter((x) => x.depose_le >= debut);
       const clients = new Set();
       rcJour.forEach((x) => clients.add(x.client_id || 'tel:' + x.telephone));
@@ -444,7 +447,7 @@ module.exports = function brancherOperateur(app, o) {
         clients_jour: clients.size, nouveaux_clients: nouveaux,
         operations_jour: rcJour.length + brJour.length + (livres.data || []).length,
         alertes: { a_receptionner: aRecevoir, colis_plus_7j: relances, recharges_attente: attente, semaine_a_cloturer: !!(sem && sem.a_cloturer && !sem.depot), depot: sem ? sem.depot : null, corrections: (corr || []).length },
-        libres: { borne: Math.max(0, NB_PLACES_BORNE - borneOcc), borne_total: NB_PLACES_BORNE, rangement: EMPLACEMENTS.length - casesPrises.size, rangement_total: EMPLACEMENTS.length },
+        libres: { borne: Math.max(0, cfgB.nb_ports - borneOcc), borne_total: cfgB.nb_ports, rangement: EMPLACEMENTS.length - casesPrises.size, rangement_total: EMPLACEMENTS.length },
       });
     } catch (err) { erreurServeur(res, 'tableau', err); }
   });
@@ -536,9 +539,11 @@ module.exports = function brancherOperateur(app, o) {
       const totRc = valides.reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
       const mobiles = valides.filter((x) => x.moyen_paiement && x.moyen_paiement !== 'especes');
       const totMobile = mobiles.reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
-      const totBr = borne.reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
+      const gardes = await gardesBorne(debut);
+      const totBr = borne.reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + sommeGardes(gardes);
       const ops = recharges.map((x) => ({ heure: x.created_at, type: 'recharge', libelle: (x.nom_client || masquerTel(x.telephone)), statut: x.statut, montant_fcfa: x.montant_fcfa, ref: x.numero, moyen: x.moyen_paiement || 'especes' }))
         .concat(borne.map((x) => ({ heure: x.depose_le, type: 'borne', libelle: 'Borne, place ' + x.place, statut: x.rendu_le ? 'rendu' : 'en_charge', montant_fcfa: x.montant_fcfa, ref: x.code_ticket })))
+        .concat(gardes.map((x) => ({ heure: x.rendu_le, type: 'borne', libelle: 'Borne, garde place ' + x.place, statut: 'rendu', montant_fcfa: x.garde_fcfa, ref: x.code_ticket })))
         .concat(epi.map((x) => ({ heure: x.created_at, type: 'epicerie', libelle: 'Épicerie, ' + x.nb_pieces + ' article(s)', statut: 'payee', montant_fcfa: x.total_fcfa, ref: x.numero })))
         .sort((a, b) => (a.heure < b.heure ? 1 : -1));
       res.json({ ok: true, depuis: debut, total_fcfa: totRc + totBr + totEpi, especes_fcfa: totRc - totMobile + totBr + totEpi, epicerie: { nb: epi.length, total_fcfa: totEpi }, mobile_fcfa: totMobile, mobile_nb: mobiles.length, recharges: { nb: valides.length, total_fcfa: totRc }, borne: { nb: borne.length, total_fcfa: totBr }, operations: ops.slice(0, 60) });
@@ -771,7 +776,7 @@ module.exports = function brancherOperateur(app, o) {
       /* Seules les espèces sont dans le tiroir : le Mobile Money est arrivé sur le compte. */
       const { data: epiV } = await db.from('epi_ventes').select('total_fcfa, moyen_paiement').gt('created_at', debut);
       const especesEpi = (epiV || []).filter((x) => !x.moyen_paiement || x.moyen_paiement === 'especes').reduce((s, x) => s + Number(x.total_fcfa || 0), 0);
-      const attendu = (rc.data || []).filter((x) => !x.moyen_paiement || x.moyen_paiement === 'especes').reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + (br.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + especesEpi;
+      const attendu = (rc.data || []).filter((x) => !x.moyen_paiement || x.moyen_paiement === 'especes').reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + (br.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + especesEpi + sommeGardes(await gardesBorne(debut));
       const fond = Math.round(Number(b.fond_fcfa || 0));
       const compte = Math.round(Number(b.especes_comptees || 0));
       /* Une seule clôture par jour : ensuite, seul le responsable peut la corriger (ou autoriser l'agent à le faire). */
@@ -991,23 +996,24 @@ module.exports = function brancherOperateur(app, o) {
     try {
       const debut = debutJourBzv();
       const [occ, auj] = await Promise.all([
-        db.from('borne_depots').select('place, depose_le, code_ticket, telephone').is('rendu_le', null).order('depose_le', { ascending: true }),
+        db.from('borne_depots').select('place, depose_le, code_ticket, telephone').is('rendu_le', null).is('debranche_le', null).order('depose_le', { ascending: true }),
         db.from('borne_depots').select('montant_fcfa').gte('depose_le', debut),
       ]);
+      const cfg = await cfgBorne(), gardes = await gardesBorne(debut, true);
       const occupees = (occ.data || []).map((x) => ({ place: x.place, depose_le: x.depose_le, heures: Math.floor((Date.now() - new Date(x.depose_le).getTime()) / 3600000) }));
-      res.json({ ok: true, nb_places: NB_PLACES_BORNE, prix_fcfa: PRIX_BORNE_FCFA, occupees, deposes_aujourdhui: (auj.data || []).length, encaisse_fcfa: (auj.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) });
+      res.json({ ok: true, nb_places: cfg.nb_ports, prix_fcfa: cfg.prix_complete, occupees, deposes_aujourdhui: (auj.data || []).length, encaisse_fcfa: (auj.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + sommeGardes(gardes) });
     } catch (err) { erreurServeur(res, 'borne', err); }
   });
 
   app.post('/op/borne/depot', requireOp, async (req, res) => {
     try {
       const b = req.body || {};
-      const place = parseInt(b.place, 10);
-      if (!(place >= 1 && place <= NB_PLACES_BORNE)) return res.json({ ok: false, error: 'place_invalide' });
-      const { data: prise } = await db.from('borne_depots').select('id').eq('place', place).is('rendu_le', null).maybeSingle();
+      const place = parseInt(b.place, 10), cfg = await cfgBorne();
+      if (!(place >= 1 && place <= cfg.nb_ports)) return res.json({ ok: false, error: 'place_invalide' });
+      const { data: prise } = await db.from('borne_depots').select('id').eq('place', place).is('rendu_le', null).is('debranche_le', null).maybeSingle();
       if (prise) return res.json({ ok: false, error: 'place_occupee' });
       const tel = b.telephone ? normTel(b.telephone) : null;
-      const ligne = { place, telephone: tel, code_ticket: 'BRN-' + aleatoire(6), montant_fcfa: PRIX_BORNE_FCFA, operateur_id: req.op.id };
+      const ligne = { place, telephone: tel, code_ticket: 'BRN-' + aleatoire(6), montant_fcfa: cfg.prix_complete, operateur_id: req.op.id, formule: 'complete', duree_min: cfg.duree_complete, fin_prevue: new Date(Date.now() + cfg.duree_complete * 60000).toISOString() };
       const { data, error } = await db.from('borne_depots').insert(ligne).select().single();
       if (error) return res.json({ ok: false, error: /duplicate|unique/i.test(error.message) ? 'place_occupee' : 'enregistrement_impossible' });
       await journal(req.op, 'borne_depot', data.code_ticket, { place });
@@ -1021,14 +1027,229 @@ module.exports = function brancherOperateur(app, o) {
       const b = req.body || {};
       const saisie = String(b.code || '').trim();
       let q = db.from('borne_depots').select('*').is('rendu_le', null);
-      if (/^\d{1,2}$/.test(saisie)) q = q.eq('place', parseInt(saisie, 10));
+      if (/^\d{1,2}$/.test(saisie)) q = q.eq('place', parseInt(saisie, 10)).is('debranche_le', null);
       else q = q.eq('code_ticket', normCode(saisie));
-      const { data: dep } = await q.maybeSingle();
+      const { data: trouves } = await q.limit(1);
+      const dep = (trouves || [])[0];
       if (!dep) return res.json({ ok: false, error: 'ticket_introuvable' });
       await db.from('borne_depots').update({ rendu_le: now(), rendu_par: req.op.id, ticket_perdu: /^\d{1,2}$/.test(saisie) }).eq('id', dep.id);
       await journal(req.op, 'borne_rendu', dep.code_ticket, { place: dep.place, ticket_perdu: /^\d{1,2}$/.test(saisie) });
       res.json({ ok: true, place: dep.place });
     } catch (err) { erreurServeur(res, 'borne rendre', err); }
+  });
+
+  /* ══ Station de recharge (écran de la caisse) ════════════════════════════
+     Règle : un téléphone occupe un port 2 h au maximum, puis il est débranché
+     et rangé dans le casier « Prêts » pour libérer le port. Garde gratuite
+     après la charge, puis payante (à l'heure le jour même, forfait par nuit).
+     Les tarifs sont réglés par le responsable (table borne_config). */
+  const CFG_BORNE_DEFAUT = {
+    nb_ports: NB_PLACES_BORNE, nb_cases: 100,
+    prix_express: 100, prix_complete: PRIX_BORNE_FCFA, prix_tablette: 250,
+    duree_express: 60, duree_complete: 120, duree_tablette: 180,
+    garde_gratuite_min: 60, garde_heure_fcfa: 50, garde_nuit_fcfa: 200, jours_abandon: 30,
+  };
+  let cfgBorneCache = null, cfgBorneLe = 0;
+  async function cfgBorne(frais) {
+    if (!frais && cfgBorneCache && Date.now() - cfgBorneLe < 30000) return cfgBorneCache;
+    let cfg = Object.assign({}, CFG_BORNE_DEFAUT);
+    try {
+      const { data, error } = await db.from('borne_config').select('*').eq('id', 1).maybeSingle();
+      if (!error && data) Object.keys(CFG_BORNE_DEFAUT).forEach((k) => { const v = Number(data[k]); if (data[k] !== null && data[k] !== undefined && Number.isFinite(v) && v >= 0) cfg[k] = Math.round(v); });
+    } catch (e) {}
+    cfg.nb_ports = Math.min(200, Math.max(1, cfg.nb_ports)); cfg.nb_cases = Math.min(500, Math.max(1, cfg.nb_cases));
+    cfgBorneCache = cfg; cfgBorneLe = Date.now();
+    return cfg;
+  }
+  const FORMULES_BORNE = { express: 'Express', complete: 'Complète', tablette: 'Tablette' };
+  const jourBzvDe = (iso) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Brazzaville', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(iso));
+  /* Garde due au moment du retrait (0 tant que le téléphone est sur la station). */
+  function gardeBorne(dep, cfg, quand) {
+    if (!dep.debranche_le) return 0;
+    const t = quand ? new Date(quand).getTime() : Date.now();
+    const debut = new Date(dep.debranche_le).getTime() + cfg.garde_gratuite_min * 60000;
+    if (t <= debut) return 0;
+    const j1 = Date.parse(jourBzvDe(dep.debranche_le)), j2 = Date.parse(jourBzvDe(new Date(t).toISOString()));
+    const nuits = Math.round((j2 - j1) / 86400000);
+    if (nuits > 0) return nuits * cfg.garde_nuit_fcfa;
+    return Math.ceil((t - debut) / 3600000) * cfg.garde_heure_fcfa;
+  }
+  /* Gardes encaissées depuis une date (elles comptent dans la caisse du jour du retrait). */
+  async function gardesBorne(depuis, inclus) {
+    try {
+      let q = db.from('borne_depots').select('garde_fcfa, rendu_le, place, code_ticket').gt('garde_fcfa', 0);
+      q = inclus ? q.gte('rendu_le', depuis) : q.gt('rendu_le', depuis);
+      const { data, error } = await q;
+      return error ? [] : (data || []);
+    } catch (e) { return []; }
+  }
+  const sommeGardes = (l) => l.reduce((s, x) => s + Number(x.garde_fcfa || 0), 0);
+  function ficheBorne(x, cfg) {
+    return { id: x.id, place: x.place, code_ticket: x.code_ticket, formule: x.formule || 'complete', montant_fcfa: x.montant_fcfa,
+      telephone_masque: x.telephone ? masquerTel(x.telephone) : null, a_telephone: !!x.telephone,
+      depose_le: x.depose_le, fin_prevue: x.fin_prevue || new Date(new Date(x.depose_le).getTime() + cfg.duree_complete * 60000).toISOString(),
+      debranche_le: x.debranche_le || null, case_no: x.case_no || null, garde_fcfa: gardeBorne(x, cfg) };
+  }
+
+  app.get('/op/station', requireOp, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      const cfg = await cfgBorne();
+      const debut = debutJourBzv();
+      const [enc, auj, gardes] = await Promise.all([
+        db.from('borne_depots').select('*').is('rendu_le', null).order('depose_le', { ascending: true }),
+        db.from('borne_depots').select('montant_fcfa, depose_le, debranche_le, rendu_le, fin_prevue').gte('depose_le', debut),
+        gardesBorne(debut, true),
+      ]);
+      const tous = (enc.data || []).map((x) => ficheBorne(x, cfg));
+      const ports = tous.filter((x) => !x.debranche_le), casier = tous.filter((x) => x.debranche_le).sort((a, b) => (a.debranche_le < b.debranche_le ? -1 : 1));
+      /* Occupation moyenne : minutes de charge cumulées / (ports × minutes écoulées depuis le premier dépôt du jour). */
+      const lj = auj.data || [], t = Date.now();
+      let occ = 0;
+      if (lj.length) {
+        const premier = Math.min.apply(null, lj.map((x) => new Date(x.depose_le).getTime()));
+        const minutes = lj.reduce((s, x) => { const fin = x.debranche_le || x.rendu_le; return s + Math.max(0, ((fin ? new Date(fin).getTime() : t) - new Date(x.depose_le).getTime()) / 60000); }, 0);
+        const dispo = cfg.nb_ports * Math.max(1, (t - premier) / 60000);
+        occ = Math.min(100, Math.round(minutes / dispo * 100));
+      }
+      res.json({ ok: true, config: cfg, ports, casier,
+        jour: { recharges: lj.length, encaisse_fcfa: lj.reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + sommeGardes(gardes), gardes_fcfa: sommeGardes(gardes), occupation: occ } });
+    } catch (err) { erreurServeur(res, 'station', err); }
+  });
+
+  app.post('/op/station/depot', requireOp, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      if (!rateLimit('station-depot:' + req.op.id, 40, 60000)) return res.status(429).json({ ok: false, error: 'trop_de_tentatives' });
+      const b = req.body || {};
+      const formule = FORMULES_BORNE[b.formule] ? b.formule : null;
+      if (!formule) return res.json({ ok: false, error: 'formule_invalide' });
+      const cfg = await cfgBorne();
+      const tel = b.telephone ? normTel(b.telephone) : null;
+      if (tel && tel.replace(/\D/g, '').length < 8) return res.json({ ok: false, error: 'telephone_invalide' });
+      for (let essai = 0; essai < 4; essai++) {
+        const { data: occ } = await db.from('borne_depots').select('place').is('rendu_le', null).is('debranche_le', null);
+        const pris = new Set((occ || []).map((x) => x.place));
+        let place = 0;
+        for (let p = 1; p <= cfg.nb_ports; p++) if (!pris.has(p)) { place = p; break; }
+        if (!place) return res.json({ ok: false, error: 'station_pleine' });
+        const duree = cfg['duree_' + formule];
+        const ligne = { place, telephone: tel, code_ticket: 'BRN-' + aleatoire(6), montant_fcfa: cfg['prix_' + formule], operateur_id: req.op.id,
+          formule, duree_min: duree, fin_prevue: new Date(Date.now() + duree * 60000).toISOString() };
+        const { data, error } = await db.from('borne_depots').insert(ligne).select().single();
+        if (error && /duplicate|unique/i.test(error.message || '')) continue;
+        if (error || !data) return res.json({ ok: false, error: 'enregistrement_impossible' });
+        await journal(req.op, 'borne_depot', data.code_ticket, { place, formule, montant: ligne.montant_fcfa });
+        return res.json({ ok: true, depot: Object.assign(ficheBorne(data, cfg), { operateur: req.op.nom || req.op.identifiant }), config: cfg });
+      }
+      res.json({ ok: false, error: 'station_pleine' });
+    } catch (err) { erreurServeur(res, 'station depot', err); }
+  });
+
+  /* Débrancher : le port se libère, le téléphone va dans la première case libre du casier, le client reçoit un SMS. */
+  app.post('/op/station/debrancher', requireOp, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      const cfg = await cfgBorne();
+      const { data: dep } = await db.from('borne_depots').select('*').eq('id', String((req.body || {}).id || '')).is('rendu_le', null).maybeSingle();
+      if (!dep) return res.json({ ok: false, error: 'depot_introuvable' });
+      if (dep.debranche_le) return res.json({ ok: true, depot: ficheBorne(dep, cfg) });
+      for (let essai = 0; essai < 4; essai++) {
+        const { data: occ } = await db.from('borne_depots').select('case_no').is('rendu_le', null).not('case_no', 'is', null);
+        const prises = new Set((occ || []).map((x) => x.case_no));
+        let c = 0;
+        for (let i = 1; i <= cfg.nb_cases; i++) if (!prises.has(i)) { c = i; break; }
+        if (!c) return res.json({ ok: false, error: 'casier_plein' });
+        const maj = { debranche_le: now(), case_no: c };
+        const { error } = await db.from('borne_depots').update(maj).eq('id', dep.id).is('debranche_le', null);
+        if (error && /duplicate|unique/i.test(error.message || '')) continue;
+        if (error) return res.json({ ok: false, error: 'enregistrement_impossible' });
+        Object.assign(dep, maj);
+        let sms = false;
+        if (dep.telephone && twilio && process.env.TWILIO_SMS_FROM) {
+          const texte = 'Colispo : votre telephone est pret (ticket ' + dep.code_ticket + '). Retrait avec votre ticket. Garde gratuite ' + Math.round(cfg.garde_gratuite_min / 60 * 10) / 10 + ' h, puis ' + cfg.garde_heure_fcfa + ' F/h.';
+          try { await twilio.messages.create({ from: process.env.TWILIO_SMS_FROM, to: dep.telephone, body: texte }); sms = true; } catch (e) { console.warn('SMS station :', e.message); }
+          if (sms) await db.from('borne_depots').update({ sms_pret: true }).eq('id', dep.id);
+        }
+        await journal(req.op, 'borne_debranche', dep.code_ticket, { place: dep.place, case_no: c, sms });
+        return res.json({ ok: true, depot: ficheBorne(dep, cfg), sms });
+      }
+      res.json({ ok: false, error: 'casier_plein' });
+    } catch (err) { erreurServeur(res, 'station debrancher', err); }
+  });
+
+  /* Retrait : ticket scanné (BRN-…) ou, ticket perdu, numéro de case. Étape 1 : on montre la garde ; étape 2 : on valide. */
+  async function trouverDepotRetrait(saisie) {
+    const s = String(saisie || '').trim();
+    let q = db.from('borne_depots').select('*').is('rendu_le', null);
+    const perdu = /^\d{1,3}$/.test(s);
+    q = perdu ? q.eq('case_no', parseInt(s, 10)) : q.eq('code_ticket', normCode(s));
+    const { data } = await q.limit(1);
+    return { dep: (data || [])[0] || null, perdu };
+  }
+  app.post('/op/station/retrait/verifier', requireOp, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      const cfg = await cfgBorne();
+      const { dep, perdu } = await trouverDepotRetrait((req.body || {}).code);
+      if (!dep) return res.json({ ok: false, error: 'ticket_introuvable' });
+      res.json({ ok: true, depot: ficheBorne(dep, cfg), ticket_perdu: perdu });
+    } catch (err) { erreurServeur(res, 'station verifier', err); }
+  });
+  app.post('/op/station/retrait', requireOp, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      const cfg = await cfgBorne();
+      const b = req.body || {};
+      const { data: dep } = await db.from('borne_depots').select('*').eq('id', String(b.id || '')).is('rendu_le', null).maybeSingle();
+      if (!dep) return res.json({ ok: false, error: 'ticket_introuvable' });
+      const garde = gardeBorne(dep, cfg);
+      /* La garde affichée à l'agent peut avoir changé d'heure entre-temps : on encaisse le montant vu à l'écran s'il est plus bas. */
+      const vue = Number.isFinite(Number(b.garde_fcfa)) ? Math.max(0, Math.round(Number(b.garde_fcfa))) : garde;
+      const maj = { rendu_le: now(), rendu_par: req.op.id, ticket_perdu: !!b.ticket_perdu, garde_fcfa: Math.min(garde, vue) };
+      const { error } = await db.from('borne_depots').update(maj).eq('id', dep.id).is('rendu_le', null);
+      if (error) return res.json({ ok: false, error: 'enregistrement_impossible' });
+      await journal(req.op, 'borne_rendu', dep.code_ticket, { place: dep.place, case_no: dep.case_no || null, garde: maj.garde_fcfa, ticket_perdu: maj.ticket_perdu });
+      res.json({ ok: true, depot: Object.assign(ficheBorne(Object.assign({}, dep, maj), cfg), { garde_fcfa: maj.garde_fcfa, rendu_le: maj.rendu_le, operateur: req.op.nom || req.op.identifiant }) });
+    } catch (err) { erreurServeur(res, 'station retrait', err); }
+  });
+
+  /* Responsable : tarifs, durées et règles de la station ; activité par jour. */
+  app.get('/admin/station', requireAdmin, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      const cfg = await cfgBorne(true);
+      const depuis = new Date(Date.now() - 30 * 86400000).toISOString();
+      const [dp, gd] = await Promise.all([
+        db.from('borne_depots').select('montant_fcfa, depose_le, formule').gte('depose_le', depuis),
+        gardesBorne(depuis, true),
+      ]);
+      const J = {};
+      const jr = (k) => (J[k] = J[k] || { jour: k, recharges: 0, express: 0, complete: 0, tablette: 0, depots_fcfa: 0, gardes_fcfa: 0 });
+      (dp.data || []).forEach((x) => { const j = jr(jourBzvDe(x.depose_le)); j.recharges++; j[x.formule || 'complete'] = (j[x.formule || 'complete'] || 0) + 1; j.depots_fcfa += Number(x.montant_fcfa || 0); });
+      gd.forEach((x) => { jr(jourBzvDe(x.rendu_le)).gardes_fcfa += Number(x.garde_fcfa || 0); });
+      const { count: casier } = await db.from('borne_depots').select('id', { count: 'exact', head: true }).is('rendu_le', null).not('debranche_le', 'is', null);
+      res.json({ ok: true, config: cfg, casier: casier || 0, jours: Object.values(J).sort((a, b) => (a.jour < b.jour ? 1 : -1)) });
+    } catch (err) { erreurServeur(res, 'admin station', err); }
+  });
+  app.post('/admin/station/config', requireAdmin, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      const b = req.body || {}, ligne = { id: 1 };
+      for (const k of Object.keys(CFG_BORNE_DEFAUT)) {
+        if (b[k] === undefined) continue;
+        const v = Math.round(Number(b[k]));
+        if (!Number.isFinite(v) || v < 0 || v > 1000000) return res.json({ ok: false, error: 'valeur_invalide', champ: k });
+        ligne[k] = v;
+      }
+      if (ligne.nb_ports !== undefined && (ligne.nb_ports < 1 || ligne.nb_ports > 200)) return res.json({ ok: false, error: 'valeur_invalide', champ: 'nb_ports' });
+      if (ligne.nb_cases !== undefined && (ligne.nb_cases < 1 || ligne.nb_cases > 500)) return res.json({ ok: false, error: 'valeur_invalide', champ: 'nb_cases' });
+      ['duree_express', 'duree_complete', 'duree_tablette'].forEach((k) => { if (ligne[k] !== undefined && ligne[k] < 10) ligne[k] = 10; });
+      ligne.modifie_le = now();
+      const { error } = await db.from('borne_config').upsert(ligne, { onConflict: 'id' });
+      if (error) return res.json({ ok: false, error: /borne_config/.test(error.message || '') ? 'table_absente' : 'enregistrement_impossible' });
+      res.json({ ok: true, config: await cfgBorne(true) });
+    } catch (err) { erreurServeur(res, 'admin station config', err); }
   });
 
   /* ── James : comptes agents ──────────────────────────────────────────── */
@@ -1090,7 +1311,7 @@ module.exports = function brancherOperateur(app, o) {
       const somme = (l) => l.reduce((t, x) => t + Number(x.montant_fcfa || 0), 0);
       res.json({ ok: true,
         recharges: recharges.length, recharges_fcfa: somme(recharges),
-        borne: borne.length, borne_fcfa: somme(borne), colis_livres: livres.length,
+        borne: borne.length, borne_fcfa: somme(borne) + sommeGardes(await gardesBorne(debut, true)), colis_livres: livres.length,
         operations: recharges.length + borne.length + livres.length });
     } catch (err) { erreurServeur(res, 'admin activite', err); }
   });
