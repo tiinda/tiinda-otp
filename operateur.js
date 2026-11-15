@@ -1304,4 +1304,18 @@ module.exports = function brancherOperateur(app, o) {
   });
 
   console.log('Espace opérateur Brazzaville : routes /op/* branchées');
+
+  /* PDA : un agent connecté (identifiant + mot de passe + Google Authenticator) peut scanner.
+     server.js l'utilise dans requireScan (en-tête x-op-session). */
+  return {
+    async verifierSessionScan(tok) {
+      try {
+        const d = lire('op', tok);
+        if (!d || !d.id || !db) return false;
+        const { data: op } = await db.from('operateurs').select('id, actif').eq('id', d.id).maybeSingle();
+        return !!(op && op.actif);
+      } catch (e) { return false; }
+    },
+  };
+
 };
