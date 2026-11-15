@@ -528,6 +528,8 @@ module.exports = function brancherOperateur(app, o) {
         db.from('recharges_operateur').select('*').gt('created_at', debut).order('created_at', { ascending: false }),
         db.from('borne_depots').select('place, montant_fcfa, depose_le, rendu_le, code_ticket').gt('depose_le', debut).order('depose_le', { ascending: false }),
       ]);
+      const { data: epiV } = await db.from('epi_ventes').select('numero, total_fcfa, created_at, nb_pieces').gt('created_at', debut).order('created_at', { ascending: false });
+      const epi = epiV || [], totEpi = epi.reduce((s, x) => s + Number(x.total_fcfa || 0), 0);
       const recharges = (rc.data || []);
       const borne = (br.data || []);
       const valides = recharges.filter((x) => x.statut !== 'refuse');
@@ -537,8 +539,9 @@ module.exports = function brancherOperateur(app, o) {
       const totBr = borne.reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
       const ops = recharges.map((x) => ({ heure: x.created_at, type: 'recharge', libelle: (x.nom_client || masquerTel(x.telephone)), statut: x.statut, montant_fcfa: x.montant_fcfa, ref: x.numero, moyen: x.moyen_paiement || 'especes' }))
         .concat(borne.map((x) => ({ heure: x.depose_le, type: 'borne', libelle: 'Borne, place ' + x.place, statut: x.rendu_le ? 'rendu' : 'en_charge', montant_fcfa: x.montant_fcfa, ref: x.code_ticket })))
+        .concat(epi.map((x) => ({ heure: x.created_at, type: 'epicerie', libelle: 'Épicerie, ' + x.nb_pieces + ' article(s)', statut: 'payee', montant_fcfa: x.total_fcfa, ref: x.numero })))
         .sort((a, b) => (a.heure < b.heure ? 1 : -1));
-      res.json({ ok: true, depuis: debut, total_fcfa: totRc + totBr, especes_fcfa: totRc - totMobile + totBr, mobile_fcfa: totMobile, mobile_nb: mobiles.length, recharges: { nb: valides.length, total_fcfa: totRc }, borne: { nb: borne.length, total_fcfa: totBr }, operations: ops.slice(0, 60) });
+      res.json({ ok: true, depuis: debut, total_fcfa: totRc + totBr + totEpi, especes_fcfa: totRc - totMobile + totBr + totEpi, epicerie: { nb: epi.length, total_fcfa: totEpi }, mobile_fcfa: totMobile, mobile_nb: mobiles.length, recharges: { nb: valides.length, total_fcfa: totRc }, borne: { nb: borne.length, total_fcfa: totBr }, operations: ops.slice(0, 60) });
     } catch (err) { erreurServeur(res, 'caisse', err); }
   });
 
@@ -766,7 +769,9 @@ module.exports = function brancherOperateur(app, o) {
         db.from('borne_depots').select('montant_fcfa').gt('depose_le', debut),
       ]);
       /* Seules les espèces sont dans le tiroir : le Mobile Money est arrivé sur le compte. */
-      const attendu = (rc.data || []).filter((x) => !x.moyen_paiement || x.moyen_paiement === 'especes').reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + (br.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
+      const { data: epiV } = await db.from('epi_ventes').select('total_fcfa, moyen_paiement').gt('created_at', debut);
+      const especesEpi = (epiV || []).filter((x) => !x.moyen_paiement || x.moyen_paiement === 'especes').reduce((s, x) => s + Number(x.total_fcfa || 0), 0);
+      const attendu = (rc.data || []).filter((x) => !x.moyen_paiement || x.moyen_paiement === 'especes').reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + (br.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + especesEpi;
       const fond = Math.round(Number(b.fond_fcfa || 0));
       const compte = Math.round(Number(b.especes_comptees || 0));
       /* Une seule clôture par jour : ensuite, seul le responsable peut la corriger (ou autoriser l'agent à le faire). */
@@ -790,6 +795,195 @@ module.exports = function brancherOperateur(app, o) {
       alerterCloture(req.op, { fond, attendu, compte, ecart, banque, jour: jourParis() }).catch((e) => console.warn('alerte clôture :', e.message));
       res.json({ ok: true, cloture: Object.assign({}, data, { operateur: req.op.nom || req.op.identifiant }) });
     } catch (err) { erreurServeur(res, 'cloture', err); }
+  });
+
+
+  /* ══ Épicerie (caisse de la boutique) ════════════════════════════════════
+     Les prix sont dans la base, fixés par le responsable depuis sa page admin.
+     La caisse envoie seulement produit + quantité : le serveur recalcule tout. */
+  const RAYONS_EPI = ['Alimentation', 'Boissons', 'Hygiène', 'Frais', 'Services', 'Autre'];
+  const normCodeEpi = (c) => String(c || '').replace(/\s+/g, '').slice(0, 40) || null;
+
+  /* Liste pour la caisse. Connexion faible au Congo : si rien n'a changé depuis la dernière fois (?v=),
+     on répond juste « inchangé » ; les photos ne sont jamais dans la liste, seulement leur adresse. */
+  app.get('/op/epicerie/produits', requireOp, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      const { data } = await db.from('epi_produits').select('id, nom, rayon, prix_fcfa, code_barres, rupture, image_url, actif, created_at, modifie_le').limit(10000);
+      const tous = data || [];
+      const v = tous.length + '-' + tous.reduce((m, x) => { const t = x.modifie_le || x.created_at || ''; return t > m ? t : m; }, '');
+      const vCourt = crypto.createHash('sha1').update(v).digest('hex').slice(0, 10);
+      if (req.query.v && req.query.v === vCourt) return res.json({ ok: true, inchange: true, v: vCourt });
+      const produits = tous.filter((x) => x.actif).sort((a, b) => a.nom.localeCompare(b.nom, 'fr')).map((x) => ({
+        id: x.id, nom: x.nom, rayon: x.rayon, prix_fcfa: x.prix_fcfa, code_barres: x.code_barres, rupture: x.rupture,
+        image_url: !x.image_url ? null : /^data:/.test(x.image_url) ? '/epicerie/image/' + x.id + '?v=' + crypto.createHash('sha1').update(x.image_url).digest('hex').slice(0, 8) : x.image_url,
+      }));
+      res.json({ ok: true, v: vCourt, rayons: RAYONS_EPI, produits });
+    } catch (err) { erreurServeur(res, 'epicerie produits', err); }
+  });
+
+  /* Photo gardée dans la fiche (si le stockage n'est pas disponible) : servie à part, gardée en cache un an par le navigateur. */
+  app.get('/epicerie/image/:id', async (req, res) => {
+    try {
+      if (!db) return res.status(404).end();
+      const { data } = await db.from('epi_produits').select('image_url').eq('id', req.params.id).maybeSingle();
+      const m = data && /^data:(image\/(?:jpeg|png|webp));base64,(.+)$/.exec(data.image_url || '');
+      if (!m) return res.status(404).end();
+      res.set('Content-Type', m[1]); res.set('Cache-Control', 'public, max-age=31536000, immutable');
+      res.send(Buffer.from(m[2], 'base64'));
+    } catch (e) { res.status(404).end(); }
+  });
+
+  app.post('/op/epicerie/vente', requireOp, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      if (!rateLimit('epi-vente:' + req.op.id, 60, 60000)) return res.status(429).json({ ok: false, error: 'trop_de_tentatives' });
+      const b = req.body || {};
+      const demandes = (Array.isArray(b.lignes) ? b.lignes : []).map((l) => ({ id: String(l.produit_id || ''), q: Math.floor(Number(l.quantite)) })).filter((l) => l.id && l.q > 0 && l.q <= 999);
+      if (!demandes.length) return res.json({ ok: false, error: 'ticket_vide' });
+      const { data: prods } = await db.from('epi_produits').select('id, nom, prix_fcfa, actif').in('id', demandes.map((d) => d.id));
+      const P = {}; (prods || []).forEach((x) => { P[x.id] = x; });
+      const lignes = [];
+      for (const d of demandes) {
+        const x = P[d.id];
+        if (!x || !x.actif) return res.json({ ok: false, error: 'produit_inconnu', produit_id: d.id });
+        lignes.push({ produit_id: x.id, nom: x.nom, prix_fcfa: Math.round(Number(x.prix_fcfa)), quantite: d.q, total_fcfa: Math.round(Number(x.prix_fcfa)) * d.q });
+      }
+      const total = lignes.reduce((t, l) => t + l.total_fcfa, 0);
+      const recu = Math.round(Number(b.recu_fcfa || 0));
+      if (recu < total) return res.json({ ok: false, error: 'montant_insuffisant', total_fcfa: total });
+      const jour = jourParis();
+      const { count } = await db.from('epi_ventes').select('id', { count: 'exact', head: true }).eq('jour', jour);
+      const numero = 'EP-' + jour.slice(2).replace(/-/g, '') + '-' + String((count || 0) + 1).padStart(4, '0');
+      const vente = { numero, jour, operateur_id: req.op.id, total_fcfa: total, recu_fcfa: recu, rendu_fcfa: recu - total, moyen_paiement: 'especes', nb_articles: lignes.length, nb_pieces: lignes.reduce((t, l) => t + l.quantite, 0) };
+      const { data: v, error } = await db.from('epi_ventes').insert(vente).select().single();
+      if (error || !v) return res.json({ ok: false, error: 'enregistrement_impossible' });
+      await db.from('epi_lignes').insert(lignes.map((l) => Object.assign({ vente_id: v.id }, l)));
+      await journal(req.op, 'epicerie_vente', numero, { total, nb: lignes.length });
+      res.json({ ok: true, vente: Object.assign({}, v, { lignes, operateur: req.op.nom || req.op.identifiant }) });
+    } catch (err) { erreurServeur(res, 'epicerie vente', err); }
+  });
+
+  /* Ticket annulé avant encaissement : rien n'est vendu, mais on le garde dans le journal. */
+  app.post('/op/epicerie/annulation', requireOp, async (req, res) => {
+    const b = req.body || {};
+    await journal(req.op, 'epicerie_ticket_annule', null, { total: Math.round(Number(b.total_fcfa || 0)), nb: Math.round(Number(b.nb || 0)) });
+    res.json({ ok: true });
+  });
+
+  /* ── Admin : produits et prix (modifiables depuis la France) ── */
+  app.get('/admin/epicerie/produits', requireAdmin, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      const { data } = await db.from('epi_produits').select('*').order('nom', { ascending: true }).limit(10000);
+      res.json({ ok: true, rayons: RAYONS_EPI, produits: data || [] });
+    } catch (err) { erreurServeur(res, 'admin epi produits', err); }
+  });
+
+
+  /* Photo d'un produit : adresse d'une image (Open Food Facts) ou photo prise sur place, réduite dans le navigateur.
+     La photo va dans le stockage Supabase (dossier public « epicerie ») ; à défaut elle reste dans la fiche. */
+  async function enregistrerImage(img) {
+    img = String(img || '');
+    if (!img) return null;
+    if (/^https:\/\/[^\s"'<>]{5,500}$/.test(img)) return img;
+    const m = /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(img);
+    if (!m || m[2].length > 55000) return null; /* environ 40 Ko maximum : les photos sont réduites dans le navigateur avant l'envoi */
+    try {
+      if (db.storage) {
+        const nom = 'produits/' + crypto.randomBytes(8).toString('hex') + '.' + (m[1] === 'jpeg' ? 'jpg' : m[1]);
+        const { error } = await db.storage.from('epicerie').upload(nom, Buffer.from(m[2], 'base64'), { contentType: 'image/' + m[1], upsert: false, cacheControl: '31536000' });
+        if (!error) { const { data } = db.storage.from('epicerie').getPublicUrl(nom); if (data && data.publicUrl) return data.publicUrl; }
+      }
+    } catch (e) { console.warn('photo produit :', e.message); }
+    return img;
+  }
+
+  /* Recherche d'un produit par son code-barres dans Open Food Facts (base publique et gratuite) : nom et photo. */
+  app.get('/admin/epicerie/off', requireAdmin, async (req, res) => {
+    try {
+      const code = String(req.query.code || '').replace(/\D/g, '');
+      if (code.length < 8) return res.json({ ok: false, error: 'code_invalide' });
+      const r = await fetch('https://world.openfoodfacts.org/api/v2/product/' + code + '.json?fields=product_name,product_name_fr,brands,quantity,image_front_small_url,image_front_url', { headers: { 'User-Agent': 'Colispo-Epicerie/1.0 (contact@coolibo.com)' } });
+      const j = await r.json().catch(() => ({}));
+      if (!j || j.status !== 1 || !j.product) return res.json({ ok: false, error: 'introuvable' });
+      const p = j.product, nom = [p.product_name_fr || p.product_name, p.brands ? p.brands.split(',')[0] : '', p.quantity].filter(Boolean).join(' ').trim();
+      /* La photo est téléchargée ici puis renvoyée au navigateur, qui la réduit à quelques Ko avant de l'enregistrer. */
+      let image_data = null;
+      const src = p.image_front_small_url || p.image_front_url;
+      if (src) {
+        try {
+          const ri = await fetch(src); const buf = Buffer.from(await ri.arrayBuffer());
+          const type = (ri.headers.get('content-type') || 'image/jpeg').split(';')[0];
+          if (ri.ok && buf.length < 400000 && /^image\/(jpeg|png|webp)$/.test(type)) image_data = 'data:' + type + ';base64,' + buf.toString('base64');
+        } catch (e) { /* pas de photo */ }
+      }
+      res.json({ ok: true, nom: nom.slice(0, 80), image_data });
+    } catch (err) { res.json({ ok: false, error: 'indisponible' }); }
+  });
+
+  async function enregistrerProduit(b, auteur) {
+    const nom = String(b.nom || '').trim().slice(0, 80);
+    const prix = Math.round(Number(String(b.prix_fcfa).replace(/[^\d]/g, '')));
+    if (!nom) return { ok: false, error: 'nom_requis' };
+    if (!Number.isFinite(prix) || prix < 0 || prix > 10000000) return { ok: false, error: 'prix_invalide' };
+    const ligne = { nom, rayon: RAYONS_EPI.includes(b.rayon) ? b.rayon : 'Autre', prix_fcfa: prix, code_barres: normCodeEpi(b.code_barres) };
+    if (b.rupture !== undefined) ligne.rupture = !!b.rupture;
+    if (b.image !== undefined) ligne.image_url = await enregistrerImage(b.image);
+    if (b.actif !== undefined) ligne.actif = !!b.actif;
+    if (ligne.code_barres) {
+      const { data: autre } = await db.from('epi_produits').select('id, nom').eq('code_barres', ligne.code_barres).maybeSingle();
+      if (autre && autre.id !== b.id) return { ok: false, error: 'code_deja_pris', par: autre.nom };
+    }
+    if (b.id) {
+      const { data: avant } = await db.from('epi_produits').select('prix_fcfa').eq('id', b.id).maybeSingle();
+      if (!avant) return { ok: false, error: 'introuvable' };
+      ligne.modifie_le = new Date().toISOString();
+      await db.from('epi_produits').update(ligne).eq('id', b.id);
+      if (Number(avant.prix_fcfa) !== prix) await db.from('epi_prix_historique').insert({ produit_id: b.id, ancien_fcfa: avant.prix_fcfa, nouveau_fcfa: prix, par: auteur });
+      return { ok: true, id: b.id };
+    }
+    const { data: n, error } = await db.from('epi_produits').insert(Object.assign({ actif: true, rupture: false }, ligne)).select().single();
+    if (error || !n) return { ok: false, error: 'enregistrement_impossible' };
+    return { ok: true, id: n.id };
+  }
+  app.post('/admin/epicerie/produit', requireAdmin, async (req, res) => {
+    try { if (!db) return pasDeBase(res); res.json(await enregistrerProduit(req.body || {}, 'admin')); }
+    catch (err) { erreurServeur(res, 'admin epi produit', err); }
+  });
+
+  /* Import d'un fichier Excel/CSV : une ligne par produit. Si le code-barres (ou à défaut le nom) existe déjà, le prix est mis à jour. */
+  app.post('/admin/epicerie/import', requireAdmin, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      const rows = Array.isArray((req.body || {}).produits) ? req.body.produits.slice(0, 5000) : [];
+      const { data: tous } = await db.from('epi_produits').select('id, nom, code_barres').limit(10000);
+      const parCode = {}, parNom = {};
+      (tous || []).forEach((x) => { if (x.code_barres) parCode[x.code_barres] = x.id; parNom[x.nom.trim().toLowerCase()] = x.id; });
+      let crees = 0, maj = 0; const erreurs = [];
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i], code = normCodeEpi(r.code_barres);
+        const id = (code && parCode[code]) || parNom[String(r.nom || '').trim().toLowerCase()] || null;
+        const out = await enregistrerProduit(Object.assign({}, r, { id }), 'import');
+        if (!out.ok) erreurs.push({ ligne: i + 2, nom: r.nom || '', erreur: out.error });
+        else if (id) maj++; else { crees++; if (code) parCode[code] = out.id; parNom[String(r.nom).trim().toLowerCase()] = out.id; }
+      }
+      res.json({ ok: true, crees, maj, erreurs });
+    } catch (err) { erreurServeur(res, 'admin epi import', err); }
+  });
+
+  /* Ventes de l'épicerie : jour par jour et produits les plus vendus. */
+  app.get('/admin/epicerie/ventes', requireAdmin, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      const jour = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.jour || '')) ? req.query.jour : jourParis();
+      const { data: ventes } = await db.from('epi_ventes').select('id, numero, total_fcfa, created_at, operateur_id').eq('jour', jour).order('created_at', { ascending: false });
+      const ids = (ventes || []).map((v) => v.id);
+      const { data: lignes } = ids.length ? await db.from('epi_lignes').select('nom, quantite, total_fcfa, vente_id').in('vente_id', ids) : { data: [] };
+      const top = {}; (lignes || []).forEach((l) => { const t = top[l.nom] || (top[l.nom] = { nom: l.nom, quantite: 0, total_fcfa: 0 }); t.quantite += l.quantite; t.total_fcfa += l.total_fcfa; });
+      res.json({ ok: true, jour, nb_tickets: (ventes || []).length, total_fcfa: (ventes || []).reduce((t, v) => t + Number(v.total_fcfa || 0), 0),
+        top: Object.values(top).sort((a, b) => b.total_fcfa - a.total_fcfa).slice(0, 10), tickets: (ventes || []).slice(0, 50) });
+    } catch (err) { erreurServeur(res, 'admin epi ventes', err); }
   });
 
   /* ── Borne de recharge de téléphones ─────────────────────────────────── */
