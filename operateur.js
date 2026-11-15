@@ -136,7 +136,29 @@ module.exports = function brancherOperateur(app, o) {
     if (!d || !d.id || !db) return res.status(401).json({ ok: false, error: 'unauthorized' });
     const { data: op } = await db.from('operateurs').select('id, identifiant, nom, actif, agence').eq('id', d.id).maybeSingle();
     if (!op || !op.actif) return res.status(401).json({ ok: false, error: 'unauthorized' });
-    req.op = op; next();
+    req.op = op; noterPresence(op); next();
+  }
+
+  /* Pointage : la première requête du jour = arrivée ; chaque requête (la page se rafraîchit
+     toutes les 30 s) met à jour la dernière activité ; la déconnexion note le départ. */
+  const PRESENCE_MAJ_MS = 60000, PRESENT_SI_MS = 3 * 60000;
+  const derniereNote = new Map();
+  async function noterPresence(op, quoi) {
+    try {
+      const t = Date.now(), cle = op.id + ':' + jourParis();
+      if (!quoi && derniereNote.has(cle) && t - derniereNote.get(cle) < PRESENCE_MAJ_MS) return;
+      derniereNote.set(cle, t);
+      const jour = jourParis(), maintenant = new Date(t).toISOString();
+      const { data: l } = await db.from('op_presences').select('id, nb_connexions, depart').eq('operateur_id', op.id).eq('jour', jour).maybeSingle();
+      if (!l) {
+        await db.from('op_presences').insert({ operateur_id: op.id, jour, arrivee: maintenant, derniere_activite: maintenant, nb_connexions: quoi === 'connexion' ? 1 : 0, depart: quoi === 'depart' ? maintenant : null });
+        return;
+      }
+      const maj = { derniere_activite: maintenant };
+      if (quoi === 'connexion') { maj.nb_connexions = (l.nb_connexions || 0) + 1; maj.depart = null; }
+      if (quoi === 'depart') maj.depart = maintenant;
+      await db.from('op_presences').update(maj).eq('id', l.id);
+    } catch (e) { /* le pointage ne doit jamais bloquer l'agent */ }
   }
   const ouvrirSession = (op) => ({ ok: true, session: signer('op', { id: op.id }, OP_SESSION_MS), operateur: { identifiant: op.identifiant, nom: op.nom, agence: op.agence } });
 
@@ -169,6 +191,7 @@ module.exports = function brancherOperateur(app, o) {
       if (ctr < 0) return res.status(401).json({ ok: false, error: 'code_invalide' });
       await db.from('operateurs').update({ dernier_compteur: ctr, derniere_connexion: now() }).eq('id', op.id);
       await journal(op, 'connexion', null, { ip: clientIp(req) });
+      await noterPresence(op, 'connexion');
       res.json(ouvrirSession(op));
     } catch (err) { erreurServeur(res, 'code', err); }
   });
@@ -415,11 +438,12 @@ module.exports = function brancherOperateur(app, o) {
       rcJour.forEach((x) => clients.add(x.client_id || 'tel:' + x.telephone));
       (livres.data || []).forEach((x) => { if (x.client_id) clients.add(x.client_id); });
       const sem = await etatSemaine().catch(() => null);
+      const { data: corr } = await db.from('caisse_clotures').select('id').eq('correction_autorisee', true).limit(20);
       res.json({
         ok: true, jour_semaine: dow, semaine_fcfa: semaine,
         clients_jour: clients.size, nouveaux_clients: nouveaux,
         operations_jour: rcJour.length + brJour.length + (livres.data || []).length,
-        alertes: { a_receptionner: aRecevoir, colis_plus_7j: relances, recharges_attente: attente, semaine_a_cloturer: !!(sem && sem.a_cloturer && !sem.depot), depot: sem ? sem.depot : null },
+        alertes: { a_receptionner: aRecevoir, colis_plus_7j: relances, recharges_attente: attente, semaine_a_cloturer: !!(sem && sem.a_cloturer && !sem.depot), depot: sem ? sem.depot : null, corrections: (corr || []).length },
         libres: { borne: Math.max(0, NB_PLACES_BORNE - borneOcc), borne_total: NB_PLACES_BORNE, rangement: EMPLACEMENTS.length - casesPrises.size, rangement_total: EMPLACEMENTS.length },
       });
     } catch (err) { erreurServeur(res, 'tableau', err); }
@@ -520,6 +544,9 @@ module.exports = function brancherOperateur(app, o) {
 
   /* ── Envoi d'une alerte à James : SMS (OP_ALERTE_TEL) + e-mail (ADMIN_EMAIL) ── */
   async function alerterJames(sujet, texte, html) {
+    const h = horodatage();
+    texte = texte + ' Le ' + h.texte + '.';
+    html = (html || '<p>' + texte + '</p>') + '<p style="color:#4A5578;font-size:13px">Envoyé le ' + h.texte + '.</p>';
     const tel = process.env.OP_ALERTE_TEL;
     if (tel && process.env.TWILIO_SMS_FROM && twilio) {
       try { await twilio.messages.create({ from: process.env.TWILIO_SMS_FROM, to: tel, body: texte }); } catch (e) { console.warn('SMS alerte :', e.message); }
@@ -532,6 +559,15 @@ module.exports = function brancherOperateur(app, o) {
       } catch (e) { console.warn('e-mail alerte :', e.message); }
     }
   }
+  /* Horodatage des alertes : date et heure de Brazzaville et de Paris (elles diffèrent en été). */
+  function horodatage(d) {
+    d = d || new Date();
+    const jour = d.toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Africa/Brazzaville' });
+    const hB = d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Brazzaville' });
+    const hP = d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' });
+    return { jour, hB, hP, texte: jour + ', ' + hB + ' heure de Brazzaville (' + hP + ' heure de Paris)' };
+  }
+  const jourLongDe = (j) => { const p = String(j).split('-').map(Number); return new Date(Date.UTC(p[0], p[1] - 1, p[2], 12)).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' }); };
   const fmtF = (n) => Math.round(Number(n || 0)).toLocaleString('fr-FR').replace(/ | /g, ' ');
   const fmtDate = (iso) => new Date(iso).toLocaleString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Brazzaville' });
 
@@ -588,7 +624,7 @@ module.exports = function brancherOperateur(app, o) {
       await journal(req.op, 'cloture_semaine', numero, { a_deposer: e.a_deposer_fcfa });
       const nom = req.op.nom || req.op.identifiant;
       alerterJames('Clôture de semaine Brazzaville : ' + fmtF(e.a_deposer_fcfa) + ' FCFA à déposer',
-        'Tiinda Brazzaville : semaine clôturée par ' + nom + ' (' + ligne.du + ' au ' + ligne.au + '). ' + fmtF(e.a_deposer_fcfa) + ' FCFA à déposer en banque avant ' + fmtDate(echeance) + '.').catch(() => {});
+        'Tiinda Brazzaville : semaine du ' + jourLongDe(ligne.du) + ' au ' + jourLongDe(ligne.au) + ' clôturée par ' + nom + '. ' + fmtF(e.a_deposer_fcfa) + ' FCFA à déposer en banque avant ' + fmtDate(echeance) + ' (heure de Brazzaville).').catch(() => {});
       res.json({ ok: true, semaine: Object.assign({}, data, { operateur: nom, jours: e.jours.map((c) => ({ jour: c.jour, compte_fcfa: c.compte_fcfa, fond_fcfa: c.fond_fcfa })) }) });
     } catch (err) { erreurServeur(res, 'cloture semaine', err); }
   });
@@ -613,13 +649,88 @@ module.exports = function brancherOperateur(app, o) {
     } catch (err) { erreurServeur(res, 'depot', err); }
   });
 
+  /* ── Corrections de clôture : uniquement par le responsable, ou par l'agent quand le responsable l'a autorisé ── */
+  async function corrigerCloture(id, b, auteur) {
+    const { data: c } = await db.from('caisse_clotures').select('*').eq('id', id).maybeSingle();
+    if (!c) return { ok: false, error: 'cloture_introuvable' };
+    const fond = Math.max(0, Math.round(Number(b.fond_fcfa || 0)));
+    const compte = Math.round(Number(b.especes_comptees));
+    const banque = b.solde_banque === undefined || b.solde_banque === '' || b.solde_banque === null ? c.solde_banque_fcfa : Math.round(Number(b.solde_banque));
+    if (!Number.isFinite(compte) || compte < 0) return { ok: false, error: 'montant_invalide' };
+    const avant = { fond_fcfa: c.fond_fcfa, compte_fcfa: c.compte_fcfa, ecart_fcfa: c.ecart_fcfa, solde_banque_fcfa: c.solde_banque_fcfa };
+    const ecart = compte - fond - Number(c.attendu_fcfa || 0);
+    const historique = (Array.isArray(c.historique) ? c.historique : []).concat([{ le: now(), par: auteur, avant }]);
+    const maj = { fond_fcfa: fond, compte_fcfa: compte, ecart_fcfa: ecart, solde_banque_fcfa: banque, correction_autorisee: false, modifiee_le: now(), historique };
+    const { error } = await db.from('caisse_clotures').update(maj).eq('id', c.id);
+    if (error) return { ok: false, error: 'enregistrement_impossible' };
+    alerterJames('Clôture du ' + jourLongDe(c.jour) + ' corrigée',
+      'Tiinda Brazzaville : clôture du ' + jourLongDe(c.jour) + ' corrigée par ' + auteur + '. Écart ' + fmtF(avant.ecart_fcfa) + ' -> ' + fmtF(ecart) + ' FCFA, compté ' + fmtF(avant.compte_fcfa) + ' -> ' + fmtF(compte) + ' FCFA.').catch(() => {});
+    return { ok: true, cloture: Object.assign({}, c, maj) };
+  }
+  /* Agent : clôtures qu'il a le droit de corriger. */
+  app.get('/op/clotures/corrigeables', requireOp, async (req, res) => {
+    try {
+      const { data } = await db.from('caisse_clotures').select('*').eq('correction_autorisee', true).limit(20);
+      res.json({ ok: true, clotures: (data || []).map((c) => ({ id: c.id, jour: c.jour, fond_fcfa: c.fond_fcfa, attendu_fcfa: c.attendu_fcfa, compte_fcfa: c.compte_fcfa, ecart_fcfa: c.ecart_fcfa, solde_banque_fcfa: c.solde_banque_fcfa })) });
+    } catch (err) { erreurServeur(res, 'corrigeables', err); }
+  });
+  app.post('/op/cloture/corriger', requireOp, async (req, res) => {
+    try {
+      const b = req.body || {};
+      const { data: c } = await db.from('caisse_clotures').select('id, correction_autorisee').eq('id', b.id).maybeSingle();
+      if (!c) return res.json({ ok: false, error: 'cloture_introuvable' });
+      if (!c.correction_autorisee) return res.json({ ok: false, error: 'correction_non_autorisee' });
+      const r = await corrigerCloture(c.id, b, 'agent ' + (req.op.nom || req.op.identifiant));
+      if (r.ok) await journal(req.op, 'cloture_corrigee', r.cloture.jour, { ecart: r.cloture.ecart_fcfa });
+      res.json(r);
+    } catch (err) { erreurServeur(res, 'corriger', err); }
+  });
+  /* Responsable : toutes les clôtures, rangées par semaine, avec les dépôts en banque. */
+  app.get('/admin/clotures', requireAdmin, async (req, res) => {
+    try {
+      const nbSem = Math.min(26, Math.max(1, parseInt(req.query.semaines || '8', 10) || 8));
+      const depuis = new Date(Date.now() - nbSem * 7 * 86400000).toISOString();
+      const [clo, sem, ops] = await Promise.all([
+        db.from('caisse_clotures').select('*').gte('created_at', depuis),
+        db.from('caisse_semaines').select('*').gte('created_at', depuis),
+        db.from('operateurs').select('id, nom, identifiant'),
+      ]);
+      const nomOp = {}; (ops.data || []).forEach((o) => { nomOp[o.id] = o.nom || o.identifiant; });
+      const lundiDe = (jour) => { const p = String(jour).split('-').map(Number); const d = new Date(Date.UTC(p[0], p[1] - 1, p[2])); d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7)); return d.toISOString().slice(0, 10); };
+      const semaines = {};
+      (clo.data || []).forEach((c) => {
+        const k = lundiDe(c.jour); (semaines[k] = semaines[k] || { lundi: k, jours: [], depots: [] }).jours.push({
+          id: c.id, jour: c.jour, operateur: nomOp[c.operateur_id] || '', fond_fcfa: c.fond_fcfa, attendu_fcfa: c.attendu_fcfa, compte_fcfa: c.compte_fcfa,
+          ecart_fcfa: c.ecart_fcfa, solde_banque_fcfa: c.solde_banque_fcfa, correction_autorisee: !!c.correction_autorisee, modifiee_le: c.modifiee_le || null, nb_corrections: Array.isArray(c.historique) ? c.historique.length : 0 });
+      });
+      (sem.data || []).forEach((w) => {
+        const k = lundiDe(w.au || w.du || String(w.created_at).slice(0, 10)); (semaines[k] = semaines[k] || { lundi: k, jours: [], depots: [] }).depots.push({
+          numero: w.numero, du: w.du, au: w.au, a_deposer_fcfa: w.a_deposer_fcfa, echeance: w.echeance, statut: w.statut, depose_fcfa: w.depose_fcfa, bordereau: w.bordereau, depose_le: w.depose_le });
+      });
+      const liste = Object.values(semaines).sort((a, b) => b.lundi.localeCompare(a.lundi));
+      liste.forEach((w) => { w.jours.sort((a, b) => a.jour.localeCompare(b.jour)); w.encaisse_fcfa = w.jours.reduce((t, c) => t + Number(c.attendu_fcfa || 0), 0); w.ecarts_fcfa = w.jours.reduce((t, c) => t + Number(c.ecart_fcfa || 0), 0); });
+      res.json({ ok: true, semaines: liste });
+    } catch (err) { erreurServeur(res, 'admin clotures', err); }
+  });
+  app.post('/admin/clotures/autoriser', requireAdmin, async (req, res) => {
+    try {
+      const b = req.body || {};
+      const { error } = await db.from('caisse_clotures').update({ correction_autorisee: !!b.autoriser }).eq('id', b.id);
+      res.json(error ? { ok: false, error: 'enregistrement_impossible' } : { ok: true });
+    } catch (err) { erreurServeur(res, 'autoriser', err); }
+  });
+  app.post('/admin/clotures/modifier', requireAdmin, async (req, res) => {
+    try { res.json(await corrigerCloture((req.body || {}).id, req.body || {}, 'le responsable')); } catch (err) { erreurServeur(res, 'admin modifier', err); }
+  });
+
   /* Clôture : James est prévenu tout de suite, par e-mail (ADMIN_EMAIL) et par SMS (OP_ALERTE_TEL, ex. +33612345678).
      L'agent peut toujours clôturer, même avec un écart. */
   async function alerterCloture(op, c) {
     const f = (n) => Math.round(Number(n || 0)).toLocaleString('fr-FR').replace(/\u202f|\u00a0/g, ' ');
     const nom = op.nom || op.identifiant;
     const etat = c.ecart === 0 ? 'caisse juste' : (c.ecart < 0 ? 'MANQUE ' + f(-c.ecart) + ' FCFA' : 'SURPLUS ' + f(c.ecart) + ' FCFA');
-    const texte = 'Tiinda Brazzaville : clôture de ' + nom + ', ' + etat + '. Attendu ' + f(c.attendu) + ' FCFA, compté ' + f(c.compte) + ' FCFA (fond ' + f(c.fond) + '). Banque : ' + f(c.banque) + ' FCFA.';
+    const h = horodatage(), jl = jourLongDe(c.jour || jourParis());
+    const texte = 'Tiinda Brazzaville : clôture du ' + jl + ' (faite à ' + h.hB + ' Brazzaville, ' + h.hP + ' Paris) par ' + nom + ', ' + etat + '. Attendu ' + f(c.attendu) + ' FCFA, compté ' + f(c.compte) + ' FCFA (fond ' + f(c.fond) + '). Banque : ' + f(c.banque) + ' FCFA.';
     const tel = process.env.OP_ALERTE_TEL;
     if (tel && process.env.TWILIO_SMS_FROM && twilio) {
       try { await twilio.messages.create({ from: process.env.TWILIO_SMS_FROM, to: tel, body: texte }); } catch (e) { console.warn('SMS alerte clôture :', e.message); }
@@ -631,8 +742,8 @@ module.exports = function brancherOperateur(app, o) {
         method: 'POST', headers: { Authorization: 'Bearer ' + cle, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           from: process.env.MAIL_FROM || 'Tiinda <noreply@tiinda.com>', to: mail,
-          subject: (c.ecart === 0 ? '' : '⚠ ') + 'Clôture de caisse Brazzaville : ' + etat + ' (' + nom + ')',
-          html: '<p>Clôture de caisse de <strong>' + nom + '</strong>, agence Brazzaville.</p>'
+          subject: (c.ecart === 0 ? '' : '⚠ ') + 'Clôture du ' + jl + ' (Brazzaville) : ' + etat + ' (' + nom + ')',
+          html: '<p><strong>Clôture de caisse du ' + jl + '</strong><br>Faite le ' + h.texte + '<br>par <strong>' + nom + '</strong>, agence Brazzaville.</p>'
             + '<table cellpadding="6" style="border-collapse:collapse;font-family:Arial,sans-serif">'
             + '<tr><td>Fond de caisse</td><td align="right">' + f(c.fond) + ' FCFA</td></tr>'
             + '<tr><td>Encaissé (attendu)</td><td align="right">' + f(c.attendu) + ' FCFA</td></tr>'
@@ -658,6 +769,9 @@ module.exports = function brancherOperateur(app, o) {
       const attendu = (rc.data || []).filter((x) => !x.moyen_paiement || x.moyen_paiement === 'especes').reduce((s, x) => s + Number(x.montant_fcfa || 0), 0) + (br.data || []).reduce((s, x) => s + Number(x.montant_fcfa || 0), 0);
       const fond = Math.round(Number(b.fond_fcfa || 0));
       const compte = Math.round(Number(b.especes_comptees || 0));
+      /* Une seule clôture par jour : ensuite, seul le responsable peut la corriger (ou autoriser l'agent à le faire). */
+      const { data: dejaFaite } = await db.from('caisse_clotures').select('id').eq('jour', jourParis()).limit(1);
+      if ((dejaFaite || []).length) return res.json({ ok: false, error: 'deja_cloturee' });
       const ecart = compte - fond - attendu;
       /* Solde du compte bancaire au Congo, renseigné chaque soir par l'agent (obligatoire). */
       if (b.solde_banque === undefined || b.solde_banque === null || String(b.solde_banque).trim() === '') return res.json({ ok: false, error: 'solde_banque_requis' });
@@ -673,7 +787,7 @@ module.exports = function brancherOperateur(app, o) {
       }
       if (error) return res.json({ ok: false, error: 'enregistrement_impossible' });
       await journal(req.op, 'cloture', jourParis(), { attendu, compte, ecart, banque });
-      alerterCloture(req.op, { fond, attendu, compte, ecart, banque }).catch((e) => console.warn('alerte clôture :', e.message));
+      alerterCloture(req.op, { fond, attendu, compte, ecart, banque, jour: jourParis() }).catch((e) => console.warn('alerte clôture :', e.message));
       res.json({ ok: true, cloture: Object.assign({}, data, { operateur: req.op.nom || req.op.identifiant }) });
     } catch (err) { erreurServeur(res, 'cloture', err); }
   });
@@ -724,9 +838,135 @@ module.exports = function brancherOperateur(app, o) {
   });
 
   /* ── James : comptes agents ──────────────────────────────────────────── */
+
+
+  /* ── Badgeuse ─────────────────────────────────────────────────────────
+     Lecteur USB 125 kHz en émulation clavier (ou douchette + badge papier BDG-…).
+     Pas besoin d'être connecté : on badge en arrivant et en partant.
+     Le premier passage du jour = arrivée, le suivant = départ, puis on alterne. */
+  const normBadge = (c) => String(c || '').toUpperCase().replace(/[^A-Z0-9-]/g, '');
+  app.post('/op/badge', async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      if (!rateLimit('op-badge:' + clientIp(req), 30, 60000)) return res.status(429).json({ ok: false, error: 'trop_de_tentatives' });
+      const code = normBadge((req.body || {}).code);
+      if (code.length < 4) return res.json({ ok: false, error: 'badge_inconnu' });
+      const { data: op } = await db.from('operateurs').select('id, nom, identifiant, actif').eq('badge', code).maybeSingle();
+      if (!op || !op.actif) { console.warn('badge inconnu', code, clientIp(req)); return res.json({ ok: false, error: 'badge_inconnu' }); }
+      const jour = jourParis(), t = new Date();
+      const { data: avant } = await db.from('op_badgeages').select('sens, le').eq('operateur_id', op.id).eq('jour', jour).order('le', { ascending: false }).limit(1);
+      const dernier = (avant || [])[0];
+      if (dernier && t - new Date(dernier.le) < 60000) return res.json({ ok: true, deja: true, nom: op.nom || op.identifiant, sens: dernier.sens, le: dernier.le });
+      const sens = !dernier || dernier.sens === 'depart' ? 'arrivee' : 'depart';
+      await db.from('op_badgeages').insert({ operateur_id: op.id, jour, sens, le: t.toISOString(), source: code.startsWith('BDG') ? 'papier' : 'rfid' });
+      await journal(op, 'badge_' + sens, null, { ip: clientIp(req) });
+      res.json({ ok: true, nom: op.nom || op.identifiant, sens, le: t.toISOString() });
+    } catch (err) { erreurServeur(res, 'badge', err); }
+  });
+
+  /* Attribuer un badge à un agent : code lu sur le lecteur, ou badge papier généré. */
+  app.post('/admin/operateurs/badge', requireAdmin, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      const b = req.body || {};
+      let code = b.generer ? 'BDG-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6) : normBadge(b.badge);
+      if (!code) code = null;
+      if (code && code.length < 4) return res.json({ ok: false, error: 'badge_invalide' });
+      if (code) {
+        const { data: autre } = await db.from('operateurs').select('id, nom').eq('badge', code).maybeSingle();
+        if (autre && autre.id !== b.id) return res.json({ ok: false, error: 'badge_deja_pris', par: autre.nom });
+      }
+      await db.from('operateurs').update({ badge: code }).eq('id', b.id);
+      res.json({ ok: true, badge: code });
+    } catch (err) { erreurServeur(res, 'admin badge', err); }
+  });
+
+  /* Départ : l'agent se déconnecte. */
+  app.post('/op/deconnexion', requireOp, async (req, res) => {
+    await noterPresence(req.op, 'depart');
+    await journal(req.op, 'deconnexion', null, null);
+    res.json({ ok: true });
+  });
+
+  /* Croisement badge / connexion : écart de plus de 15 min, ou l'un sans l'autre. */
+  function croiser(p, badge, present, fin) {
+    const a = [], mn = (x, y) => Math.round((new Date(x) - new Date(y)) / 60000);
+    if (!badge || !badge.arrivee) { a.push('Connecté sans badger son arrivée'); return a; }
+    const ea = mn(p.arrivee, badge.arrivee);
+    if (Math.abs(ea) > 15) a.push('Arrivée : ' + (ea > 0 ? 'connecté ' + ea + ' min après le badge' : 'connecté ' + (-ea) + ' min avant le badge'));
+    if (!present && fin) {
+      if (!badge.depart || badge.en_cours) a.push('Départ non badgé');
+      else { const ed = mn(fin, badge.depart); if (Math.abs(ed) > 15) a.push('Départ : ' + (ed > 0 ? 'encore actif ' + ed + ' min après le badge' : 'parti de la page ' + (-ed) + ' min avant le badge')); }
+    }
+    return a;
+  }
+
+  /* Pointage vu par l'administrateur : aujourd'hui et les jours précédents. */
+  app.get('/admin/presences', requireAdmin, async (req, res) => {
+    try {
+      if (!db) return pasDeBase(res);
+      /* ?mois=2026-11 : tout le mois ; sinon les N derniers jours. */
+      let depuis, jusqua = '9999-12-31';
+      const mois = String(req.query.mois || '');
+      if (/^\d{4}-\d{2}$/.test(mois)) {
+        const [a, m] = mois.split('-').map(Number);
+        depuis = mois + '-01'; jusqua = new Date(Date.UTC(a, m, 0)).toISOString().slice(0, 10);
+      } else {
+        const n = Math.min(Math.max(parseInt(req.query.jours, 10) || 14, 1), 62);
+        depuis = new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+      }
+      const [{ data: pres }, { data: ops }, { data: clos }, { data: bdg }] = await Promise.all([
+        db.from('op_presences').select('*').gte('jour', depuis).lte('jour', jusqua).order('jour', { ascending: false }),
+        db.from('operateurs').select('id, nom, identifiant, actif'),
+        db.from('caisse_clotures').select('operateur_id, jour, created_at').gte('jour', depuis).lte('jour', jusqua),
+        db.from('op_badgeages').select('operateur_id, jour, sens, le').gte('jour', depuis).lte('jour', jusqua),
+      ]);
+      /* Badges du jour : première arrivée, dernier départ, temps entre chaque paire arrivée/départ. */
+      const B = {};
+      (bdg || []).slice().sort((a, b) => (a.le < b.le ? -1 : 1)).forEach((x) => {
+        const k = x.operateur_id + ':' + x.jour, o = B[k] || (B[k] = { arrivee: null, depart: null, minutes: 0, ouvert: null, nb: 0 });
+        o.nb++;
+        if (x.sens === 'arrivee') { if (!o.arrivee) o.arrivee = x.le; o.ouvert = x.le; }
+        else { o.depart = x.le; if (o.ouvert) { o.minutes += Math.round((new Date(x.le) - new Date(o.ouvert)) / 60000); o.ouvert = null; } }
+      });
+      const nom = {}; (ops || []).forEach((o) => { nom[o.id] = o.nom || o.identifiant; });
+      const cloA = {}; (clos || []).forEach((c) => { cloA[c.operateur_id + ':' + c.jour] = c.created_at; });
+      const aujourdhui = jourParis(), t = Date.now();
+      /* Un jour badgé sans aucune connexion apparaît aussi. */
+      const presT = (pres || []).slice();
+      const vus = new Set(presT.map((p) => p.operateur_id + ':' + p.jour));
+      Object.keys(B).forEach((k) => { if (!vus.has(k)) { const i = k.lastIndexOf(':'); presT.push({ operateur_id: k.slice(0, i), jour: k.slice(i + 1), sans_connexion: true }); } });
+      const ECART_MAX = 15;
+      const lignes = presT.map((p) => {
+        const b = B[p.operateur_id + ':' + p.jour] || null;
+        const badge = b ? { arrivee: b.arrivee, depart: b.depart, minutes: b.minutes + (b.ouvert && p.jour === aujourdhui ? Math.round((t - new Date(b.ouvert)) / 60000) : 0), en_cours: !!b.ouvert } : null;
+        if (p.sans_connexion) {
+          return { operateur_id: p.operateur_id, operateur: nom[p.operateur_id] || '?', jour: p.jour, arrivee: null, depart: null, present: false, duree_min: null, nb_connexions: 0,
+            cloture_le: cloA[p.operateur_id + ':' + p.jour] || null, badge, alertes: ['Badgé sans connexion à la page'] };
+        }
+        const present = p.jour === aujourdhui && !p.depart && t - new Date(p.derniere_activite).getTime() < PRESENT_SI_MS;
+        const fin = present ? null : (p.depart || p.derniere_activite);
+        return {
+          operateur_id: p.operateur_id, operateur: nom[p.operateur_id] || '?', jour: p.jour,
+          arrivee: p.arrivee, depart: fin, depart_note: !!p.depart, present,
+          duree_min: Math.round(((fin ? new Date(fin).getTime() : t) - new Date(p.arrivee).getTime()) / 60000),
+          nb_connexions: p.nb_connexions || 0, cloture_le: cloA[p.operateur_id + ':' + p.jour] || null,
+          badge, alertes: croiser(p, badge, present, fin),
+        };
+      }).sort((a, b) => (a.jour < b.jour ? 1 : a.jour > b.jour ? -1 : a.operateur.localeCompare(b.operateur)));
+      const auj = (ops || []).filter((o) => o.actif).map((o) => lignes.find((l) => l.jour === aujourdhui && l.operateur_id === o.id) || { operateur_id: o.id, operateur: nom[o.id], jour: aujourdhui, absent: true });
+      const totaux = {};
+      lignes.forEach((l) => {
+        const t0 = totaux[l.operateur_id] || (totaux[l.operateur_id] = { operateur: l.operateur, jours: 0, minutes: 0, minutes_badge: 0, alertes: 0 });
+        t0.jours++; t0.minutes += Math.max(0, l.duree_min || 0); t0.minutes_badge += l.badge ? Math.max(0, l.badge.minutes) : 0; t0.alertes += l.alertes.length ? 1 : 0;
+      });
+      res.json({ ok: true, du: depuis, au: jusqua, aujourdhui: auj, lignes, totaux: Object.values(totaux).sort((a, b) => a.operateur.localeCompare(b.operateur)) });
+    } catch (err) { erreurServeur(res, 'presences', err); }
+  });
+
   app.get('/admin/operateurs', requireAdmin, async (req, res) => {
     try {
-      const { data } = await db.from('operateurs').select('id, identifiant, nom, agence, actif, active_le, derniere_connexion, activation_expire, created_at').order('created_at', { ascending: true });
+      const { data } = await db.from('operateurs').select('id, identifiant, nom, agence, actif, active_le, derniere_connexion, activation_expire, created_at, badge').order('created_at', { ascending: true });
       res.json({ ok: true, operateurs: (data || []).filter((o) => !String(o.identifiant).startsWith('supprime.')) });
     } catch (err) { erreurServeur(res, 'admin operateurs', err); }
   });
