@@ -1644,11 +1644,17 @@ function requireAdmin(req, res, next) {
 
 // Accès "scan entrepôt" : SCAN_TOKEN dédié (PDA / équipe) ou session admin.
 // Le mot de passe admin seul n'est plus accepté une fois la 2FA activée.
+let verifierSessionScan = null; // fourni par operateur.js : session d'un agent (identifiant + mot de passe + Google Authenticator)
 function requireScan(req, res, next) {
   const token = req.headers['x-scan-token'] || req.headers['x-admin-token'];
   if (process.env.SCAN_TOKEN && egalSur(token, process.env.SCAN_TOKEN)) return next();
   if (verifAdminSession(req.headers['x-admin-session'])) return next();
   if (!totpActif() && ADMIN_TOKEN && egalSur(token, ADMIN_TOKEN)) return next();
+  if (verifierSessionScan && req.headers['x-op-session']) {
+    return verifierSessionScan(req.headers['x-op-session'])
+      .then((ok) => (ok ? next() : res.status(401).json({ ok: false, error: 'unauthorized' })))
+      .catch(() => res.status(401).json({ ok: false, error: 'unauthorized' }));
+  }
   return res.status(401).json({ ok: false, error: 'unauthorized' });
 }
 
@@ -3409,10 +3415,10 @@ app.get('/admin/ecran', requireAdmin, async (req, res) => {
 });
 
 /* ── Espace opérateur de l'agence de Brazzaville (routes /op/*) ─────────── */
-require('./operateur')(app, {
+verifierSessionScan = require('./operateur')(app, {
   db, twilio: client, rateLimit, clientIp, b64url, SESSION_KEY, base32Decode, totpCode,
   requireAdmin, notifyColisStatus, noterEtapeTiinda, hashPassword, verifyPassword,
-});
+}).verifierSessionScan;
 
 app.listen(PORT, () => {
   console.log(`TIINDA backend en écoute sur le port ${PORT}, Supabase: ${db ? 'OK' : 'NON configuré'}`);
