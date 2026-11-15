@@ -414,11 +414,12 @@ module.exports = function brancherOperateur(app, o) {
       const clients = new Set();
       rcJour.forEach((x) => clients.add(x.client_id || 'tel:' + x.telephone));
       (livres.data || []).forEach((x) => { if (x.client_id) clients.add(x.client_id); });
+      const sem = await etatSemaine().catch(() => null);
       res.json({
         ok: true, jour_semaine: dow, semaine_fcfa: semaine,
         clients_jour: clients.size, nouveaux_clients: nouveaux,
         operations_jour: rcJour.length + brJour.length + (livres.data || []).length,
-        alertes: { a_receptionner: aRecevoir, colis_plus_7j: relances, recharges_attente: attente },
+        alertes: { a_receptionner: aRecevoir, colis_plus_7j: relances, recharges_attente: attente, semaine_a_cloturer: !!(sem && sem.a_cloturer && !sem.depot), depot: sem ? sem.depot : null },
         libres: { borne: Math.max(0, NB_PLACES_BORNE - borneOcc), borne_total: NB_PLACES_BORNE, rangement: EMPLACEMENTS.length - casesPrises.size, rangement_total: EMPLACEMENTS.length },
       });
     } catch (err) { erreurServeur(res, 'tableau', err); }
@@ -515,6 +516,101 @@ module.exports = function brancherOperateur(app, o) {
         .sort((a, b) => (a.heure < b.heure ? 1 : -1));
       res.json({ ok: true, depuis: debut, total_fcfa: totRc + totBr, especes_fcfa: totRc - totMobile + totBr, mobile_fcfa: totMobile, mobile_nb: mobiles.length, recharges: { nb: valides.length, total_fcfa: totRc }, borne: { nb: borne.length, total_fcfa: totBr }, operations: ops.slice(0, 60) });
     } catch (err) { erreurServeur(res, 'caisse', err); }
+  });
+
+  /* ── Envoi d'une alerte à James : SMS (OP_ALERTE_TEL) + e-mail (ADMIN_EMAIL) ── */
+  async function alerterJames(sujet, texte, html) {
+    const tel = process.env.OP_ALERTE_TEL;
+    if (tel && process.env.TWILIO_SMS_FROM && twilio) {
+      try { await twilio.messages.create({ from: process.env.TWILIO_SMS_FROM, to: tel, body: texte }); } catch (e) { console.warn('SMS alerte :', e.message); }
+    }
+    const mail = process.env.ADMIN_EMAIL, cle = process.env.RESEND_API_KEY;
+    if (mail && cle) {
+      try {
+        await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: 'Bearer ' + cle, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ from: process.env.MAIL_FROM || 'Tiinda <noreply@tiinda.com>', to: mail, subject: sujet, html: html || '<p>' + texte + '</p>' }) });
+      } catch (e) { console.warn('e-mail alerte :', e.message); }
+    }
+  }
+  const fmtF = (n) => Math.round(Number(n || 0)).toLocaleString('fr-FR').replace(/ | /g, ' ');
+  const fmtDate = (iso) => new Date(iso).toLocaleString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Brazzaville' });
+
+  /* ── Clôture de semaine : les espèces de la semaine (compté − fond, jour par jour) sont à déposer en banque sous 48 h ── */
+  const DELAI_DEPOT_H = 48;
+  async function etatSemaine() {
+    const { data: sems } = await db.from('caisse_semaines').select('*').order('created_at', { ascending: false }).limit(50);
+    const liste = (sems || []).slice().sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+    const derniere = liste[0] || null;
+    const depuis = derniere ? derniere.created_at : new Date(Date.now() - 60 * 86400000).toISOString();
+    const { data: clos } = await db.from('caisse_clotures').select('*').gt('created_at', depuis);
+    const jours = (clos || []).slice().sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+    const aDeposer = jours.reduce((t, c) => t + Math.max(0, Number(c.compte_fcfa || 0) - Number(c.fond_fcfa || 0)), 0);
+    /* Il faut clôturer la semaine dès que la clôture du samedi est faite, ou si des jours d'une semaine passée restent ouverts. */
+    const [y, m, d] = jourParis().split('-').map(Number);
+    const dow = (new Date(Date.UTC(y, m - 1, d)).getUTCDay() + 6) % 7;
+    const lundiIso = new Date(Date.UTC(y, m - 1, d - dow) - 3600000).toISOString();
+    const samediClos = jours.some((c) => { const p = String(c.jour).split('-').map(Number); return new Date(Date.UTC(p[0], p[1] - 1, p[2])).getUTCDay() === 6; });
+    const semainePassee = jours.some((c) => c.created_at < lundiIso);
+    const enCours = liste.find((x) => x.statut === 'a_deposer') || null;
+    let depot = null;
+    if (enCours) {
+      const resteMs = new Date(enCours.echeance).getTime() - Date.now();
+      depot = { id: enCours.id, numero: enCours.numero, a_deposer_fcfa: enCours.a_deposer_fcfa, echeance: enCours.echeance, reste_h: Math.max(0, Math.floor(resteMs / 3600000)), en_retard: resteMs < 0 };
+      if (depot.en_retard && !enCours.alerte_retard) {
+        await db.from('caisse_semaines').update({ alerte_retard: true }).eq('id', enCours.id);
+        alerterJames('⚠ Dépôt en banque en retard (Brazzaville)', 'Tiinda Brazzaville : RETARD de dépôt en banque. ' + fmtF(enCours.a_deposer_fcfa) + ' FCFA devaient être déposés avant ' + fmtDate(enCours.echeance) + ' (semaine ' + enCours.numero + ').').catch(() => {});
+      }
+    }
+    return { a_cloturer: jours.length > 0 && (samediClos || semainePassee), jours, a_deposer_fcfa: aDeposer, depot };
+  }
+
+  app.get('/op/semaine', requireOp, async (req, res) => {
+    try {
+      const e = await etatSemaine();
+      res.json({ ok: true, a_cloturer: e.a_cloturer, nb_jours: e.jours.length, a_deposer_fcfa: e.a_deposer_fcfa,
+        jours: e.jours.map((c) => ({ jour: c.jour, encaisse_fcfa: c.attendu_fcfa, compte_fcfa: c.compte_fcfa, fond_fcfa: c.fond_fcfa, ecart_fcfa: c.ecart_fcfa })), depot: e.depot });
+    } catch (err) { erreurServeur(res, 'semaine', err); }
+  });
+
+  app.post('/op/semaine/cloturer', requireOp, async (req, res) => {
+    try {
+      if (!rateLimit('op-sem:' + req.op.id, 10, 60000)) return res.status(429).json({ ok: false, error: 'trop_de_tentatives' });
+      const e = await etatSemaine();
+      if (!e.jours.length) return res.json({ ok: false, error: 'aucune_journee' });
+      if (e.depot) return res.json({ ok: false, error: 'depot_en_attente' });
+      const numero = 'SEM-' + jourParis().replace(/-/g, '').slice(2);
+      const echeance = new Date(Date.now() + DELAI_DEPOT_H * 3600000).toISOString();
+      const ligne = { operateur_id: req.op.id, numero, du: e.jours[0].jour, au: e.jours[e.jours.length - 1].jour, nb_jours: e.jours.length,
+        encaisse_fcfa: e.jours.reduce((t, c) => t + Number(c.attendu_fcfa || 0), 0), ecarts_fcfa: e.jours.reduce((t, c) => t + Number(c.ecart_fcfa || 0), 0),
+        a_deposer_fcfa: e.a_deposer_fcfa, echeance, statut: 'a_deposer' };
+      const { data, error } = await db.from('caisse_semaines').insert(ligne).select().single();
+      if (error || !data) return res.json({ ok: false, error: 'enregistrement_impossible' });
+      await journal(req.op, 'cloture_semaine', numero, { a_deposer: e.a_deposer_fcfa });
+      const nom = req.op.nom || req.op.identifiant;
+      alerterJames('Clôture de semaine Brazzaville : ' + fmtF(e.a_deposer_fcfa) + ' FCFA à déposer',
+        'Tiinda Brazzaville : semaine clôturée par ' + nom + ' (' + ligne.du + ' au ' + ligne.au + '). ' + fmtF(e.a_deposer_fcfa) + ' FCFA à déposer en banque avant ' + fmtDate(echeance) + '.').catch(() => {});
+      res.json({ ok: true, semaine: Object.assign({}, data, { operateur: nom, jours: e.jours.map((c) => ({ jour: c.jour, compte_fcfa: c.compte_fcfa, fond_fcfa: c.fond_fcfa })) }) });
+    } catch (err) { erreurServeur(res, 'cloture semaine', err); }
+  });
+
+  app.post('/op/semaine/depot', requireOp, async (req, res) => {
+    try {
+      if (!rateLimit('op-depot:' + req.op.id, 10, 60000)) return res.status(429).json({ ok: false, error: 'trop_de_tentatives' });
+      const b = req.body || {};
+      const { data: sem } = await db.from('caisse_semaines').select('*').eq('id', b.id).maybeSingle();
+      if (!sem || sem.statut !== 'a_deposer') return res.json({ ok: false, error: 'depot_introuvable' });
+      const montant = Math.round(Number(b.montant || 0));
+      const bordereau = String(b.bordereau || '').trim().slice(0, 40);
+      if (!(montant > 0)) return res.json({ ok: false, error: 'montant_requis' });
+      if (bordereau.length < 3) return res.json({ ok: false, error: 'bordereau_requis' });
+      const enRetard = Date.now() > new Date(sem.echeance).getTime();
+      await db.from('caisse_semaines').update({ statut: 'depose', depose_fcfa: montant, bordereau, depose_le: now(), depose_par: req.op.id }).eq('id', sem.id);
+      await journal(req.op, 'depot_banque', sem.numero, { montant, bordereau, en_retard: enRetard });
+      const ecart = montant - Number(sem.a_deposer_fcfa || 0);
+      alerterJames((ecart === 0 ? '' : '⚠ ') + 'Dépôt en banque Brazzaville : ' + fmtF(montant) + ' FCFA',
+        'Tiinda Brazzaville : dépôt en banque de ' + fmtF(montant) + ' FCFA (bordereau ' + bordereau + ')' + (ecart === 0 ? '' : ', écart ' + fmtF(ecart) + ' FCFA sur ' + fmtF(sem.a_deposer_fcfa)) + (enRetard ? ', EN RETARD' : '') + '.').catch(() => {});
+      res.json({ ok: true, ecart_fcfa: ecart, en_retard: enRetard });
+    } catch (err) { erreurServeur(res, 'depot', err); }
   });
 
   /* Clôture : James est prévenu tout de suite, par e-mail (ADMIN_EMAIL) et par SMS (OP_ALERTE_TEL, ex. +33612345678).
